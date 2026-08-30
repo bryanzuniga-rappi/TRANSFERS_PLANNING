@@ -193,6 +193,9 @@ CITY_DISPLAY_NAMES = {
     "MTY": "Monterrey",
 }
 
+DEFAULT_STORAGE = "Room Temperature"
+MISSING_STORAGE_VALUES = {"", "UNKNOWN", "UNKNOW", "N/A", "NA", "NONE", "NULL"}
+
 ENGLISH_MONTHS = {
     "JANUARY": 1,
     "FEBRUARY": 2,
@@ -1070,7 +1073,7 @@ def load_insumos_rows(
                     "ROUTE": 1,
                     "DELIVERY_PRIORITY": 1,
                     "CITY": store.get("city", ""),
-                    "STORAGE": catalogs.storage.get(sku, "UNKNOWN"),
+                    "STORAGE": resolved_storage(catalogs.storage.get(sku)),
                     "VALUE": catalogs.high_value.get(sku, "REGULAR"),
                 }
             )
@@ -1230,6 +1233,66 @@ def percentage(numerator: float, denominator: float) -> float:
     if denominator <= 0:
         return 0.0
     return round((numerator / denominator) * 100, 1)
+
+
+def resolved_storage(value: Any) -> str:
+    raw = engine.clean_text(value)
+    if raw.upper() in MISSING_STORAGE_VALUES:
+        return DEFAULT_STORAGE
+    return raw
+
+
+def is_fruver_storage(value: Any) -> bool:
+    normalized = engine.normalize_header(value)
+    return "FRUVER" in normalized
+
+
+def normalize_result_storage(result) -> None:
+    """Garantiza una clasificación operativa en reportes y archivos Bulk."""
+    for row in result.base_rows:
+        row["STORAGE"] = resolved_storage(row.get("STORAGE"))
+    for row in result.allocation_rows:
+        row["STORAGE"] = resolved_storage(row.get("STORAGE"))
+
+
+def apply_fruver_811_block(
+    catalogs,
+    origins: tuple[int, ...],
+    requested: bool,
+) -> dict[str, Any]:
+    """Vuelve no elegible el stock FRUVER del origen 811 antes de planear."""
+    summary = {
+        "requested": requested,
+        "enabled": requested and 811 in origins,
+        "products_identified": 0,
+        "products_with_stock_blocked": 0,
+        "units_blocked": 0.0,
+    }
+    if not summary["enabled"]:
+        return summary
+
+    fruver_skus = {
+        sku
+        for sku, storage_name in catalogs.storage.items()
+        if is_fruver_storage(storage_name)
+    }
+    summary["products_identified"] = len(fruver_skus)
+    for sku in fruver_skus:
+        key = (811, sku)
+        base_stock = max(float(catalogs.stock_base.get(key, 0.0)), 0.0)
+        already_unavailable = max(
+            float(catalogs.unavailable_stock.get(key, 0.0)),
+            0.0,
+        )
+        newly_blocked = max(base_stock - already_unavailable, 0.0)
+        if newly_blocked <= 0:
+            continue
+        catalogs.unavailable_stock[key] = max(already_unavailable, base_stock)
+        summary["products_with_stock_blocked"] += 1
+        summary["units_blocked"] += newly_blocked
+
+    summary["units_blocked"] = round(summary["units_blocked"], 3)
+    return summary
 
 
 def build_planning_analytics(
@@ -1498,7 +1561,7 @@ def build_planning_analytics(
         warehouse_name = (
             base_row.get("WAREHOUSE_NAME") or f"WAREHOUSE {destination}"
         )
-        storage = row.get("STORAGE") or "UNKNOWN"
+        storage = resolved_storage(row.get("STORAGE"))
         line_m3 = quantity * float(
             m3_by_destination_sku.get((destination, sku), 0.0)
         )
@@ -1782,6 +1845,184 @@ def apply_reporting_labels(result) -> None:
                 renamed_row["ROQ_ORIGINAL" if key == "MOV_ORIGINAL" else key] = value
             row.clear()
             row.update(renamed_row)
+
+
+def build_golden_analytics(result) -> dict[str, Any]:
+    """Construye el reporte específico de Golden Infaltables."""
+    golden_rows = [
+        row
+        for row in result.base_rows
+        if bool(row.get("ES_GOLDEN_INFALTABLE", False))
+        and int(row.get("CANTIDAD_OBJETIVO", 0) or 0) > 0
+    ]
+    city_data: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "served": 0,
+            "full": 0,
+            "products": set(),
+            "stores": set(),
+            "target": 0,
+            "assigned": 0,
+        }
+    )
+    store_data: dict[tuple[str, int, str], dict[str, Any]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "served": 0,
+            "full": 0,
+            "products": set(),
+            "target": 0,
+            "assigned": 0,
+        }
+    )
+    origin_data: dict[int, dict[str, Any]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "products": set(),
+            "stores": set(),
+            "units": 0,
+        }
+    )
+    detail_rows: list[dict[str, Any]] = []
+    for row in golden_rows:
+        city = row.get("CITY") or "SIN CIUDAD"
+        destination = int(row["WAREHOUSE_DESTINATION"])
+        warehouse_name = row.get("WAREHOUSE_NAME") or "SIN NOMBRE"
+        sku = int(row["RETAIL_ID"])
+        sku_name = engine.clean_text(row.get("SKU_NAME"))
+        target = int(row.get("CANTIDAD_OBJETIVO", 0) or 0)
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
+
+        city_bucket = city_data[city]
+        city_bucket["cases"] += 1
+        city_bucket["served"] += int(assigned > 0)
+        city_bucket["full"] += int(assigned >= target)
+        city_bucket["products"].add(sku)
+        city_bucket["stores"].add(destination)
+        city_bucket["target"] += target
+        city_bucket["assigned"] += assigned
+
+        store_bucket = store_data[(city, destination, warehouse_name)]
+        store_bucket["cases"] += 1
+        store_bucket["served"] += int(assigned > 0)
+        store_bucket["full"] += int(assigned >= target)
+        store_bucket["products"].add(sku)
+        store_bucket["target"] += target
+        store_bucket["assigned"] += assigned
+
+        for key, value in row.items():
+            if not key.startswith("ASIGNADO_"):
+                continue
+            source_text = key.removeprefix("ASIGNADO_")
+            if not source_text.isdigit():
+                continue
+            source_units = int(value or 0)
+            if source_units <= 0:
+                continue
+            source = int(source_text)
+            origin_bucket = origin_data[source]
+            origin_bucket["cases"] += 1
+            origin_bucket["products"].add(sku)
+            origin_bucket["stores"].add(destination)
+            origin_bucket["units"] += source_units
+
+        detail_rows.append(
+            {
+                "CIUDAD": city,
+                "TIENDA": f"{destination} · {warehouse_name}",
+                "SKU": f"{sku} · {sku_name}" if sku_name else str(sku),
+                "OBJETIVO": target,
+                "ASIGNADO": assigned,
+                "FALTANTE": max(target - assigned, 0),
+                "ORÍGENES": row.get("ORIGENES_USADOS", ""),
+                "BREAKDOWN": row.get("TIPO_DE_CORTE", ""),
+            }
+        )
+
+    city_rows = [
+        {
+            "CIUDAD": city,
+            "CASOS": data["cases"],
+            "CON_ENVÍO": data["served"],
+            "COMPLETOS": data["full"],
+            "TIENDAS": len(data["stores"]),
+            "PRODUCTOS": len(data["products"]),
+            "OBJETIVO": data["target"],
+            "ASIGNADO": data["assigned"],
+            "COMPLIANCE_%": percentage(data["assigned"], data["target"]),
+        }
+        for city, data in sorted(city_data.items())
+    ]
+    store_rows = [
+        {
+            "CIUDAD": city,
+            "TIENDA": f"{destination} · {warehouse_name}",
+            "CASOS": data["cases"],
+            "CON_ENVÍO": data["served"],
+            "COMPLETOS": data["full"],
+            "PRODUCTOS": len(data["products"]),
+            "OBJETIVO": data["target"],
+            "ASIGNADO": data["assigned"],
+            "FALTANTE": max(data["target"] - data["assigned"], 0),
+            "COMPLIANCE_%": percentage(data["assigned"], data["target"]),
+        }
+        for (city, destination, warehouse_name), data in store_data.items()
+    ]
+    store_rows.sort(key=lambda row: (-row["FALTANTE"], row["TIENDA"]))
+    origin_rows = [
+        {
+            "ORIGEN": source,
+            "NOMBRE": ORIGIN_WAREHOUSES.get(source, "ORIGEN CONFIGURADO"),
+            "CASOS_CON_APORTE": data["cases"],
+            "PRODUCTOS": len(data["products"]),
+            "TIENDAS": len(data["stores"]),
+            "UNIDADES": data["units"],
+        }
+        for source, data in sorted(origin_data.items())
+    ]
+    detail_rows.sort(
+        key=lambda row: (-row["FALTANTE"], row["CIUDAD"], row["TIENDA"], row["SKU"])
+    )
+
+    target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in golden_rows)
+    assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in golden_rows)
+    served_rows = [row for row in golden_rows if row["CANTIDAD_ASIGNADA"] > 0]
+    full_rows = [
+        row
+        for row in golden_rows
+        if row["CANTIDAD_ASIGNADA"] >= row["CANTIDAD_OBJETIVO"]
+    ]
+    partial_rows = [
+        row
+        for row in golden_rows
+        if 0 < row["CANTIDAD_ASIGNADA"] < row["CANTIDAD_OBJETIVO"]
+    ]
+    return {
+        "summary": {
+            "cases": len(golden_rows),
+            "served_cases": len(served_rows),
+            "full_cases": len(full_rows),
+            "partial_cases": len(partial_rows),
+            "not_served_cases": len(golden_rows) - len(served_rows),
+            "products": len({row["RETAIL_ID"] for row in golden_rows}),
+            "stores": len({row["WAREHOUSE_DESTINATION"] for row in golden_rows}),
+            "cities": len({row.get("CITY") or "SIN CIUDAD" for row in golden_rows}),
+            "target_units": target_units,
+            "assigned_units": assigned_units,
+            "missing_units": max(target_units - assigned_units, 0),
+            "case_compliance_pct": percentage(len(full_rows), len(golden_rows)),
+            "unit_compliance_pct": percentage(assigned_units, target_units),
+            "m3_assigned": round(
+                sum(float(row.get("M3_ASIGNADO", 0) or 0) for row in golden_rows),
+                3,
+            ),
+        },
+        "city_rows": city_rows,
+        "store_rows": store_rows,
+        "origin_rows": origin_rows,
+        "detail_rows": detail_rows,
+    }
 
 
 def split_plan_rows_by_closed_store(
@@ -2125,7 +2366,7 @@ def apply_avl_fill(
                     "ROUTE": 1,
                     "DELIVERY_PRIORITY": 1,
                     "CITY": city,
-                    "STORAGE": catalogs.storage.get(sku, "UNKNOWN"),
+                    "STORAGE": resolved_storage(catalogs.storage.get(sku)),
                     "VALUE": catalogs.high_value.get(sku, "REGULAR"),
                 }
             )
@@ -2202,7 +2443,7 @@ def apply_avl_fill(
             "ORIGENES_USADOS": " | ".join(
                 f"{source}:{quantity}" for source, quantity in allocations
             ),
-            "STORAGE": catalogs.storage.get(sku, "UNKNOWN"),
+            "STORAGE": resolved_storage(catalogs.storage.get(sku)),
             "VALUE": catalogs.high_value.get(sku, "REGULAR"),
             "TIPO_DE_CORTE": "ENVIADOS PARA CUBRIR AVL",
             "DETALLE_MOTIVO": (
@@ -2263,6 +2504,7 @@ def write_executive_pdf(
     closed_stores: dict[str, Any],
     insumos: dict[str, Any],
     avl: dict[str, Any],
+    fruver_811: dict[str, Any],
 ) -> None:
     """Genera un reporte PDF ejecutivo, legible y listo para compartir."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2503,7 +2745,13 @@ def write_executive_pdf(
                 f"{closed_stores.get('requirements', 0):,} casos por tienda cerrada; "
                 f"{city_block.get('requirements', 0):,} por ciudad bloqueada; "
                 f"{insumos.get('lines_added', 0):,} líneas y "
-                f"{insumos.get('units_added', 0):,} unidades de insumos.",
+                f"{insumos.get('units_added', 0):,} unidades de insumos. "
+                + (
+                    f"FRUVER 811 bloqueado: "
+                    f"{fruver_811.get('products_with_stock_blocked', 0):,} productos."
+                    if fruver_811.get("enabled")
+                    else "FRUVER 811 sin bloqueo manual."
+                ),
                 body_style,
             ),
         ],
@@ -2588,6 +2836,103 @@ def write_executive_pdf(
         ]
     )
 
+    golden = analytics.get("golden", {})
+    golden_summary = golden.get("summary", {})
+    if golden_summary:
+        story.extend(
+            [
+                PageBreak(),
+                Paragraph("GOLDEN INFALTABLES", title_style),
+                Paragraph(
+                    "Seguimiento exclusivo de los casos Golden: cobertura completa "
+                    "por caso, cumplimiento de unidades y faltantes prioritarios.",
+                    subtitle_style,
+                ),
+                Spacer(1, 3 * mm),
+                kpi_cards(
+                    [
+                        ("Casos Golden", fmt_int(golden_summary["cases"]), blue),
+                        ("Casos completos", fmt_int(golden_summary["full_cases"]), acid),
+                        (
+                            "Compliance de casos",
+                            fmt_pct(golden_summary["case_compliance_pct"]),
+                            paper,
+                        ),
+                        (
+                            "Compliance de unidades",
+                            fmt_pct(golden_summary["unit_compliance_pct"]),
+                            coral,
+                        ),
+                    ]
+                ),
+                Paragraph("GOLDEN POR CIUDAD", section_style),
+                report_table_pdf(
+                    golden.get("city_rows", []),
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("CASOS", "CASOS", fmt_int),
+                        ("COMPLETOS", "COMPLETOS", fmt_int),
+                        ("TIENDAS", "TIENDAS", fmt_int),
+                        ("OBJETIVO", "OBJETIVO", fmt_int),
+                        ("ASIGNADO", "ASIGNADO", fmt_int),
+                        ("COMPLIANCE_%", "COMPLIANCE", fmt_pct),
+                    ],
+                    [55 * mm, 27 * mm, 31 * mm, 28 * mm, 32 * mm, 32 * mm, 34 * mm],
+                ),
+                Paragraph("GOLDEN POR ORIGEN", section_style),
+                report_table_pdf(
+                    golden.get("origin_rows", []),
+                    [
+                        ("ORIGEN", "ORIGEN", str),
+                        ("NOMBRE", "NOMBRE", str),
+                        ("CASOS_CON_APORTE", "CASOS CON APORTE", fmt_int),
+                        ("PRODUCTOS", "PRODUCTOS", fmt_int),
+                        ("TIENDAS", "TIENDAS", fmt_int),
+                        ("UNIDADES", "UNIDADES", fmt_int),
+                    ],
+                    [30 * mm, 85 * mm, 31 * mm, 35 * mm, 34 * mm, 38 * mm],
+                ),
+                Paragraph("TOP 15 TIENDAS GOLDEN POR FALTANTE", section_style),
+                report_table_pdf(
+                    golden.get("store_rows", []),
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("TIENDA", "TIENDA", str),
+                        ("CASOS", "CASOS", fmt_int),
+                        ("PRODUCTOS", "PRODUCTOS", fmt_int),
+                        ("OBJETIVO", "OBJETIVO", fmt_int),
+                        ("ASIGNADO", "ASIGNADO", fmt_int),
+                        ("FALTANTE", "FALTANTE", fmt_int),
+                        ("COMPLIANCE_%", "COMPLIANCE", fmt_pct),
+                    ],
+                    [34 * mm, 76 * mm, 22 * mm, 28 * mm, 27 * mm, 27 * mm, 26 * mm, 30 * mm],
+                    max_rows=15,
+                ),
+                PageBreak(),
+                Paragraph("DETALLE GOLDEN TIENDA-SKU", title_style),
+                Paragraph(
+                    "Casos ordenados por unidades faltantes para facilitar la "
+                    "gestión de excepciones prioritarias.",
+                    subtitle_style,
+                ),
+                Spacer(1, 3 * mm),
+                report_table_pdf(
+                    golden.get("detail_rows", []),
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("TIENDA", "TIENDA", str),
+                        ("SKU", "SKU", str),
+                        ("OBJETIVO", "OBJ.", fmt_int),
+                        ("ASIGNADO", "ASIG.", fmt_int),
+                        ("FALTANTE", "FALT.", fmt_int),
+                        ("BREAKDOWN", "BREAKDOWN", str),
+                    ],
+                    [31 * mm, 59 * mm, 66 * mm, 21 * mm, 21 * mm, 21 * mm, 47 * mm],
+                    max_rows=20,
+                ),
+            ]
+        )
+
     for detail in analytics.get("source_details", []):
         source = detail["warehouse_source"]
         source_summary = detail["summary"]
@@ -2656,11 +3001,6 @@ def write_executive_pdf(
         canvas.saveState()
         canvas.setFillColor(paper)
         canvas.rect(0, 0, page_width, page_height, fill=1, stroke=0)
-        canvas.setFillColor(black)
-        canvas.rect(0, page_height - 7 * mm, page_width, 7 * mm, fill=1, stroke=0)
-        canvas.setFont("Helvetica-Bold", 7)
-        canvas.setFillColor(paper)
-        canvas.drawString(13 * mm, page_height - 4.7 * mm, "SUPPLY · TRANSFER PLANNER")
         canvas.setFont("Helvetica", 6.5)
         canvas.setFillColor(grey)
         canvas.drawString(13 * mm, 6 * mm, f"Planeación {run_date:%d-%m-%Y}")
@@ -2695,6 +3035,7 @@ def execute_planning(
     include_insumos: bool = True,
     include_avl_fill: bool = False,
     avl_doh: float = 3.0,
+    block_fruver_811: bool = False,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -2720,6 +3061,18 @@ def execute_planning(
     captured = io.StringIO()
     with redirect_stdout(captured):
         catalogs = engine.load_catalogs(data_path, config)
+        fruver_811_summary = apply_fruver_811_block(
+            catalogs,
+            origins,
+            block_fruver_811,
+        )
+        if fruver_811_summary["enabled"]:
+            catalogs.warnings.append(
+                "Bloqueo FRUVER 811: se volvió no elegible el stock de "
+                f"{fruver_811_summary['products_with_stock_blocked']:,} productos "
+                f"({fruver_811_summary['units_blocked']:,.0f} unidades) antes de "
+                "la asignación. Los demás orígenes permanecieron disponibles."
+            )
         closed_store_ids = load_closed_store_ids(data_path)
         insumos_rows: list[dict[str, Any]] = []
         if include_insumos and 444 in origins:
@@ -2791,8 +3144,10 @@ def execute_planning(
                 "tareas remanentes."
             )
 
+        normalize_result_storage(result)
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
+        analytics["golden"] = build_golden_analytics(result)
         output_dir = (
             Path(config.local_work_dir)
             / "outputs"
@@ -2848,6 +3203,7 @@ def execute_planning(
             closed_stores=closed_summary,
             insumos=insumos_summary,
             avl=avl_summary,
+            fruver_811=fruver_811_summary,
         )
         local_files.append(pdf_path)
         print(f"Requerimientos únicos del input: {len(plan_read.rows):,}")
@@ -2893,6 +3249,7 @@ def execute_planning(
         "closed_stores": closed_summary,
         "insumos": insumos_summary,
         "avl": avl_summary,
+        "fruver_811": fruver_811_summary,
     }
 
 
@@ -3033,10 +3390,28 @@ def render_source_analysis(analytics: dict[str, Any]) -> None:
                 '<span class="section-label">POR CIUDAD</span>',
                 unsafe_allow_html=True,
             )
+            compact_city_rows = [
+                {
+                    "CIUDAD": row["CIUDAD"],
+                    "TAREAS": row["TAREAS"],
+                    "UNIDADES": row["UNIDADES"],
+                    "M3": row["M3"],
+                }
+                for row in detail["city_rows"]
+            ]
             report_table(
-                detail["city_rows"],
+                compact_city_rows,
                 column_config={
-                    "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+                    "CIUDAD": st.column_config.TextColumn("CIUDAD", width="medium"),
+                    "TAREAS": st.column_config.NumberColumn(
+                        "TAREAS", format="%d", width="small"
+                    ),
+                    "UNIDADES": st.column_config.NumberColumn(
+                        "UNIDADES", format="%d", width="small"
+                    ),
+                    "M3": st.column_config.NumberColumn(
+                        "M³", format="%.3f", width="small"
+                    ),
                 },
                 max_height=340,
             )
@@ -3045,10 +3420,30 @@ def render_source_analysis(analytics: dict[str, Any]) -> None:
                 '<span class="section-label">POR STORAGE</span>',
                 unsafe_allow_html=True,
             )
+            compact_storage_rows = [
+                {
+                    "STORAGE": resolved_storage(row["STORAGE"]),
+                    "TAREAS": row["TAREAS"],
+                    "UNIDADES": row["UNIDADES"],
+                    "M3": row["M3"],
+                }
+                for row in detail["storage_rows"]
+            ]
             report_table(
-                detail["storage_rows"],
+                compact_storage_rows,
                 column_config={
-                    "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+                    "STORAGE": st.column_config.TextColumn(
+                        "STORAGE", width="medium"
+                    ),
+                    "TAREAS": st.column_config.NumberColumn(
+                        "TAREAS", format="%d", width="small"
+                    ),
+                    "UNIDADES": st.column_config.NumberColumn(
+                        "UNIDADES", format="%d", width="small"
+                    ),
+                    "M3": st.column_config.NumberColumn(
+                        "M³", format="%.3f", width="small"
+                    ),
                 },
                 max_height=340,
             )
@@ -3067,6 +3462,177 @@ def render_source_analysis(analytics: dict[str, Any]) -> None:
             },
             max_height=520,
         )
+
+
+def render_golden_report(analytics: dict[str, Any]) -> None:
+    golden = analytics.get("golden", {})
+    summary = golden.get("summary", {})
+    if not summary:
+        return
+
+    st.markdown(
+        '<div class="report-title">GOLDEN INFALTABLES.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            Este bloque considera únicamente casos marcados como Golden Infaltables.
+            COMPLIANCE DE CASOS exige cubrir el objetivo completo de cada tienda-SKU;
+            COMPLIANCE DE UNIDADES compara las unidades asignadas contra las unidades
+            objetivo. Las tarjetas distinguen casos, unidades, tiendas y productos.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    render_kpi_cards(
+        [
+            {
+                "category": "CASOS · GOLDEN",
+                "label": "REQUERIMIENTOS",
+                "value": f"{summary['cases']:,}",
+                "description": (
+                    "Combinaciones tienda–SKU Golden Infaltable con objetivo mayor "
+                    "a cero evaluadas por el motor."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "CASOS · GOLDEN",
+                "label": "CON ENVÍO",
+                "value": f"{summary['served_cases']:,}",
+                "description": (
+                    "Casos Golden que recibieron al menos una unidad, aunque la "
+                    "cobertura haya quedado parcial."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "CASOS · GOLDEN",
+                "label": "CUBIERTOS AL 100%",
+                "value": f"{summary['full_cases']:,}",
+                "description": (
+                    "Casos Golden cuya cantidad asignada alcanzó completamente su "
+                    "cantidad objetivo."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "CASOS · GOLDEN",
+                "label": "SIN ENVÍO",
+                "value": f"{summary['not_served_cases']:,}",
+                "description": (
+                    "Casos Golden con objetivo positivo que no recibieron ninguna "
+                    "unidad por alguna regla de corte."
+                ),
+                "tone": "coral",
+            },
+            {
+                "category": "UNIDADES · GOLDEN",
+                "label": "OBJETIVO",
+                "value": f"{summary['target_units']:,}",
+                "description": (
+                    "Suma de las unidades objetivo de todos los casos Golden. No es "
+                    "un conteo de tareas."
+                ),
+            },
+            {
+                "category": "UNIDADES · GOLDEN",
+                "label": "ASIGNADAS",
+                "value": f"{summary['assigned_units']:,}",
+                "description": (
+                    "Unidades de producto realmente asignadas a casos Golden desde "
+                    "todos los orígenes."
+                ),
+                "tone": "acid",
+            },
+            {
+                "category": "COMPLIANCE · CASOS",
+                "label": "CASOS COMPLETOS",
+                "value": f"{summary['case_compliance_pct']:,.1f}%",
+                "description": (
+                    "Casos Golden cubiertos al 100% divididos entre todos los casos "
+                    "Golden con objetivo positivo."
+                ),
+                "tone": "blue",
+            },
+            {
+                "category": "COMPLIANCE · UNIDADES",
+                "label": "UNIDADES CUBIERTAS",
+                "value": f"{summary['unit_compliance_pct']:,.1f}%",
+                "description": (
+                    "Unidades Golden asignadas divididas entre las unidades Golden "
+                    "objetivo. Puede diferir del compliance de casos."
+                ),
+                "tone": "blue",
+            },
+        ]
+    )
+
+    st.markdown('<span class="section-label">GOLDEN POR CIUDAD</span>', unsafe_allow_html=True)
+    compact_city = [
+        {
+            "CIUDAD": row["CIUDAD"],
+            "CASOS": row["CASOS"],
+            "COMPLETOS": row["COMPLETOS"],
+            "TIENDAS": row["TIENDAS"],
+            "OBJETIVO": row["OBJETIVO"],
+            "ASIGNADO": row["ASIGNADO"],
+            "COMPLIANCE_%": row["COMPLIANCE_%"],
+        }
+        for row in golden.get("city_rows", [])
+    ]
+    report_table(
+        compact_city,
+        column_config={
+            "COMPLIANCE_%": st.column_config.NumberColumn(
+                "COMPLIANCE %", format="%.1f%%", width="small"
+            ),
+        },
+        max_height=360,
+    )
+
+    st.markdown('<span class="section-label">GOLDEN POR ORIGEN</span>', unsafe_allow_html=True)
+    report_table(golden.get("origin_rows", []), max_height=300)
+
+    st.markdown('<span class="section-label">GOLDEN POR TIENDA</span>', unsafe_allow_html=True)
+    report_table(
+        golden.get("store_rows", []),
+        column_config={
+            "TIENDA": st.column_config.TextColumn("TIENDA", width="large"),
+            "COMPLIANCE_%": st.column_config.NumberColumn(
+                "COMPLIANCE %", format="%.1f%%", width="small"
+            ),
+        },
+        max_height=520,
+    )
+
+    st.markdown(
+        '<span class="section-label">DETALLE TIENDA–SKU GOLDEN</span>',
+        unsafe_allow_html=True,
+    )
+    report_table(
+        golden.get("detail_rows", []),
+        column_config={
+            "CIUDAD": st.column_config.TextColumn("CIUDAD", width="small"),
+            "TIENDA": st.column_config.TextColumn("TIENDA", width="medium"),
+            "SKU": st.column_config.TextColumn("SKU", width="medium"),
+            "OBJETIVO": st.column_config.NumberColumn(
+                "OBJETIVO", format="%d", width="small"
+            ),
+            "ASIGNADO": st.column_config.NumberColumn(
+                "ASIGNADO", format="%d", width="small"
+            ),
+            "FALTANTE": st.column_config.NumberColumn(
+                "FALTANTE", format="%d", width="small"
+            ),
+            "ORÍGENES": st.column_config.TextColumn("ORÍGENES", width="small"),
+            "BREAKDOWN": st.column_config.TextColumn(
+                "BREAKDOWN", width="medium"
+            ),
+        },
+        max_height=650,
+    )
 
 
 def render_planning_analytics(analytics: dict[str, Any]) -> None:
@@ -3391,6 +3957,8 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
         ]
     )
 
+    render_golden_report(analytics)
+
     st.markdown('<span class="section-label">REGLAS DE DEMANDA</span>', unsafe_allow_html=True)
     report_table(
         analytics["rule_rows"],
@@ -3553,6 +4121,15 @@ def render_results(run: dict[str, Any]) -> None:
             f"{avl.get('cases_sent', 0):,} casos, "
             f"{avl.get('tasks_added', 0):,} tareas y "
             f"{avl.get('units_added', 0):,} unidades adicionales."
+        )
+
+    fruver_811 = run.get("fruver_811", {})
+    if fruver_811.get("enabled"):
+        st.warning(
+            "Bloqueo FRUVER 811 aplicado: "
+            f"{fruver_811.get('products_with_stock_blocked', 0):,} productos y "
+            f"{fruver_811.get('units_blocked', 0):,.0f} unidades de stock del 811 "
+            "quedaron fuera de la asignación; los demás orígenes siguieron activos."
         )
 
     insumos = run.get("insumos", {})
@@ -3739,6 +4316,16 @@ def main() -> None:
             ),
         )
 
+        block_fruver_811 = st.toggle(
+            "Bloquear envíos FRUVER desde el warehouse 811",
+            value=False,
+            help=(
+                "Cuando está activo y el 811 es un origen seleccionado, su stock "
+                "de productos clasificados como FRUVER queda fuera de la asignación. "
+                "El motor puede cubrirlos desde los demás orígenes disponibles."
+            ),
+        )
+
         avl_left, avl_right = st.columns([2, 1])
         with avl_left:
             include_avl_fill = st.toggle(
@@ -3805,6 +4392,16 @@ def main() -> None:
                     )
                 else:
                     st.write("Envío de insumos desactivado para esta corrida.")
+                if block_fruver_811 and 811 in origins:
+                    st.write(
+                        "Bloqueando el stock FRUVER del origen 811 y habilitando "
+                        "la reasignación desde otros orígenes…"
+                    )
+                elif block_fruver_811:
+                    st.write(
+                        "Bloqueo FRUVER 811 activo, pero sin efecto porque el 811 "
+                        "no está seleccionado como origen."
+                    )
                 st.write("Calculando demanda, stock, capacidad y tareas…")
                 if include_avl_fill:
                     st.write(
@@ -3821,6 +4418,7 @@ def main() -> None:
                     include_insumos=include_insumos,
                     include_avl_fill=include_avl_fill,
                     avl_doh=float(avl_doh),
+                    block_fruver_811=block_fruver_811,
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run
