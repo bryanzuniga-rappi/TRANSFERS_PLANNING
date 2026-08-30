@@ -2375,13 +2375,19 @@ def split_plan_rows_by_blocked_city(
     plan_rows: list[dict[str, Any]],
     catalogs,
     blocked_cities: tuple[str, ...],
+    config: engine.Config,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Bloquea solo necesidades positivas; los ceros conservan SIN RECOMENDACIÓN."""
     blocked_city_set = set(blocked_cities)
     active_rows: list[dict[str, Any]] = []
     blocked_rows: list[dict[str, Any]] = []
     for row in plan_rows:
         store = catalogs.stores.get(row["WAREHOUSE_DESTINATION"], {})
-        if store.get("city_norm", "") in blocked_city_set:
+        target_quantity, _ = engine.calculate_target_quantity(row, config)
+        if (
+            store.get("city_norm", "") in blocked_city_set
+            and target_quantity > 0
+        ):
             blocked_rows.append(row)
         else:
             active_rows.append(row)
@@ -3501,6 +3507,7 @@ def execute_planning(
             rows_after_closed_stores,
             catalogs,
             blocked_cities,
+            config,
         )
 
         result = engine.plan_transfers(active_plan_rows, catalogs, config)
