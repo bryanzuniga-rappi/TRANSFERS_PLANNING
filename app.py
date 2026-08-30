@@ -113,10 +113,16 @@ SHEET_DESCRIPTIONS = {
 }
 
 DEMAND_RULE_LABELS = {
-    "MOV_MINIMO_3": "MOV POSITIVO",
+    "MOV_MINIMO_3": "ROQ POSITIVO",
     "HARDCODE_4_CERO_TOTAL": "FORECAST 0 · FORZADO A 4",
-    "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": "MOV 0 · INVENTARIO MENOR A DEMANDA",
-    "SIN_DEMANDA": "SIN DEMANDA DE REABASTO",
+    "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": "ROQ 0 · INVENTARIO MENOR A DEMANDA",
+    "SIN_DEMANDA": "SIN RECOMENDACIÓN",
+}
+
+CITY_DISPLAY_NAMES = {
+    "CDMX": "Ciudad de México",
+    "GDL": "Guadalajara",
+    "MTY": "Monterrey",
 }
 
 ENGLISH_MONTHS = {
@@ -633,6 +639,41 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
     }
 
 
+def extract_available_cities(workbook_bytes: bytes) -> dict[str, str]:
+    workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=True
+    )
+    try:
+        labels: dict[str, str] = {}
+        for row in engine.iter_sheet_records(
+            workbook,
+            "TIENDA",
+            ["CITY"],
+            ["CITY"],
+        ):
+            raw_city = engine.clean_text(row["CITY"])
+            normalized_city = engine.normalize_city(raw_city)
+            if not normalized_city:
+                continue
+            labels.setdefault(
+                normalized_city,
+                CITY_DISPLAY_NAMES.get(normalized_city, raw_city or normalized_city),
+            )
+    finally:
+        workbook.close()
+
+    preferred_order = {"CDMX": 0, "GDL": 1, "MTY": 2}
+    return dict(
+        sorted(
+            labels.items(),
+            key=lambda item: (
+                preferred_order.get(item[0], 99),
+                item[1].upper(),
+            ),
+        )
+    )
+
+
 def save_uploaded_file(uploaded_file, destination: Path) -> None:
     destination.parent.mkdir(parents=True, exist_ok=True)
     uploaded_file.seek(0)
@@ -1030,12 +1071,100 @@ def build_planning_analytics(result) -> dict[str, Any]:
     }
 
 
+def apply_reporting_labels(result) -> None:
+    """Cambia únicamente etiquetas de salida; las reglas internas no se alteran."""
+    for row in result.base_rows:
+        if row.get("TIPO_DE_CORTE") == "SIN DEMANDA":
+            row["TIPO_DE_CORTE"] = "SIN RECOMENDACIÓN"
+
+        detail = row.get("DETALLE_MOTIVO")
+        if isinstance(detail, str):
+            row["DETALLE_MOTIVO"] = detail.replace("MOV", "ROQ").replace(
+                "Sin demanda", "Sin recomendación"
+            )
+
+        demand_rule = row.get("REGLA_DEMANDA")
+        if isinstance(demand_rule, str):
+            row["REGLA_DEMANDA"] = demand_rule.replace(
+                "SIN_DEMANDA", "SIN_RECOMENDACION"
+            ).replace("MOV", "ROQ")
+
+        if "MOV_ORIGINAL" in row:
+            renamed_row: dict[str, Any] = {}
+            for key, value in row.items():
+                renamed_row["ROQ_ORIGINAL" if key == "MOV_ORIGINAL" else key] = value
+            row.clear()
+            row.update(renamed_row)
+
+
+def split_plan_rows_by_blocked_city(
+    plan_rows: list[dict[str, Any]],
+    catalogs,
+    blocked_cities: tuple[str, ...],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    blocked_city_set = set(blocked_cities)
+    active_rows: list[dict[str, Any]] = []
+    blocked_rows: list[dict[str, Any]] = []
+    for row in plan_rows:
+        store = catalogs.stores.get(row["WAREHOUSE_DESTINATION"], {})
+        if store.get("city_norm", "") in blocked_city_set:
+            blocked_rows.append(row)
+        else:
+            active_rows.append(row)
+    return active_rows, blocked_rows
+
+
+def city_block_summary(
+    blocked_rows: list[dict[str, Any]],
+    catalogs,
+    config: engine.Config,
+    blocked_cities: tuple[str, ...],
+) -> dict[str, Any]:
+    rows_by_city: Counter[str] = Counter()
+    city_names: dict[str, str] = {}
+    for store in catalogs.stores.values():
+        city_norm = store.get("city_norm", "")
+        if city_norm in blocked_cities and city_norm not in city_names:
+            city_names[city_norm] = CITY_DISPLAY_NAMES.get(
+                city_norm,
+                store.get("city") or city_norm,
+            )
+    target_units = 0
+    stores: set[int] = set()
+    products: set[int] = set()
+    for row in blocked_rows:
+        destination = row["WAREHOUSE_DESTINATION"]
+        store = catalogs.stores.get(destination, {})
+        city_norm = store.get("city_norm", "")
+        rows_by_city[city_norm] += 1
+        stores.add(destination)
+        products.add(row["RETAIL_ID"])
+        target, _ = engine.calculate_target_quantity(row, config)
+        target_units += target
+
+    return {
+        "cities": [
+            {
+                "code": city,
+                "name": city_names.get(city, CITY_DISPLAY_NAMES.get(city, city)),
+                "requirements": rows_by_city.get(city, 0),
+            }
+            for city in blocked_cities
+        ],
+        "requirements": len(blocked_rows),
+        "stores": len(stores),
+        "products": len(products),
+        "target_units": target_units,
+    }
+
+
 def execute_planning(
     uploaded_plan,
     database_bytes: bytes,
     origins: tuple[int, ...],
     max_tasks: int,
     run_date,
+    blocked_cities: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -1060,15 +1189,50 @@ def execute_planning(
 
     captured = io.StringIO()
     with redirect_stdout(captured):
-        response = engine.run_pipeline(
-            config,
-            local_data_transfers_path=data_path,
-            local_plan_path=plan_path,
-            upload_to_drive=False,
+        catalogs = engine.load_catalogs(data_path, config)
+        plan_read = engine.read_plan_csv(plan_path, config)
+        active_plan_rows, blocked_plan_rows = split_plan_rows_by_blocked_city(
+            plan_read.rows,
+            catalogs,
+            blocked_cities,
         )
 
-    result = response["result"]
-    local_files = [Path(path) for path in response["local_files"]]
+        result = engine.plan_transfers(active_plan_rows, catalogs, config)
+        result.warnings.extend(plan_read.warnings)
+        block_summary = city_block_summary(
+            blocked_plan_rows,
+            catalogs,
+            config,
+            blocked_cities,
+        )
+        if blocked_plan_rows:
+            blocked_names = ", ".join(
+                item["name"] for item in block_summary["cities"]
+            )
+            result.warnings.append(
+                f"Bloqueo manual de ciudad: {blocked_names}. Se excluyeron "
+                f"{len(blocked_plan_rows):,} requerimientos antes de asignar stock."
+            )
+
+        analytics = build_planning_analytics(result)
+        apply_reporting_labels(result)
+        output_dir = (
+            Path(config.local_work_dir)
+            / "outputs"
+            / run_date.strftime("%d-%m-%Y")
+        )
+        local_files = engine.create_output_files(
+            result,
+            config,
+            run_date,
+            plan_path.name,
+            output_dir,
+        )
+        print(f"Requerimientos activos: {len(active_plan_rows):,}")
+        print(f"Requerimientos excluidos por ciudad: {len(blocked_plan_rows):,}")
+        print(f"Tareas generadas: {result.tasks_used:,}")
+
+    local_files = [Path(path) for path in local_files]
     zip_path = create_zip(
         local_files,
         workspace / f"Planeacion_{run_date:%d-%m-%Y}.zip",
@@ -1076,7 +1240,6 @@ def execute_planning(
     status_counts = dict(Counter(row["TIPO_DE_CORTE"] for row in result.base_rows))
     units = sum(row["QUANTITY"] for row in result.allocation_rows)
     requirements = len(result.base_rows)
-    analytics = build_planning_analytics(result)
     return {
         "workspace": str(workspace),
         "files": [str(path) for path in local_files],
@@ -1089,6 +1252,7 @@ def execute_planning(
         "logs": captured.getvalue(),
         "origins": list(origins),
         "analytics": analytics,
+        "city_block": block_summary,
     }
 
 
@@ -1250,6 +1414,18 @@ def render_results(run: dict[str, Any]) -> None:
     col2.metric("TAREAS", f"{run['tasks']:,}")
     col3.metric("UNIDADES", f"{run['units']:,}")
 
+    city_block = run.get("city_block", {})
+    if city_block.get("requirements", 0) > 0:
+        city_names = ", ".join(
+            item["name"] for item in city_block.get("cities", [])
+        )
+        st.warning(
+            f"Bloqueo de ciudad aplicado: {city_names}. Se excluyeron "
+            f"{city_block['requirements']:,} requerimientos, "
+            f"{city_block['stores']:,} tiendas y "
+            f"{city_block['products']:,} productos antes de asignar stock."
+        )
+
     st.markdown('<span class="section-label">DESCARGAR TODO</span>', unsafe_allow_html=True)
     zip_path = Path(run["zip"])
     st.download_button(
@@ -1315,10 +1491,12 @@ def main() -> None:
     st.markdown('<span class="section-label">01 — BASE DE DATOS</span>', unsafe_allow_html=True)
     database_bytes: bytes | None = None
     database_health: dict[str, Any] | None = None
+    city_labels: dict[str, str] = {}
     try:
         with st.spinner("Validando fuentes de información…"):
             database_bytes = fetch_public_database()
             database_health = inspect_database(database_bytes)
+            city_labels = extract_available_cities(database_bytes)
         render_database_health(database_health)
     except Exception as exc:
         st.markdown(
@@ -1377,6 +1555,23 @@ def main() -> None:
                 step=500,
             )
 
+        selected_blocked_cities = st.multiselect(
+            "Bloquear ciudades completas — opcional",
+            options=list(city_labels),
+            default=[],
+            format_func=lambda city: city_labels.get(city, city),
+            help=(
+                "No se generarán envíos hacia las ciudades seleccionadas. Sus "
+                "requerimientos se eliminan antes de asignar, por lo que ese stock "
+                "queda disponible para otras tiendas."
+            ),
+        )
+        if selected_blocked_cities:
+            selected_names = ", ".join(
+                city_labels.get(city, city) for city in selected_blocked_cities
+            )
+            st.warning(f"Se bloqueará completamente: {selected_names}")
+
         submitted = st.form_submit_button(
             "EJECUTAR PLANEACIÓN →", use_container_width=True
         )
@@ -1401,6 +1596,12 @@ def main() -> None:
                         "La base de datos tiene una o más fuentes con error. "
                         "Abre el panel de estado y corrige las hojas indicadas."
                     )
+                if selected_blocked_cities:
+                    blocked_names = ", ".join(
+                        city_labels.get(city, city)
+                        for city in selected_blocked_cities
+                    )
+                    st.write(f"Excluyendo ciudades bloqueadas: {blocked_names}…")
                 st.write("Calculando demanda, stock, capacidad y tareas…")
                 run = execute_planning(
                     uploaded_plan=uploaded_plan,
@@ -1408,6 +1609,7 @@ def main() -> None:
                     origins=origins,
                     max_tasks=int(max_tasks),
                     run_date=run_date,
+                    blocked_cities=tuple(selected_blocked_cities),
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run
