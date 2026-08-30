@@ -160,10 +160,19 @@ DEMAND_RULE_LABELS = {
     "HARDCODE_3_NET_TRANSFER_BAJO": "NET TRANSFER BAJO · FORZADO A 3",
 }
 
+MANUAL_FORECAST_ZERO_RULES = frozenset(
+    {
+        "HARDCODE_4_CERO_TOTAL",
+        "HARDCODE_3_INVENTARIO_MENOR_DEMANDA",
+        "HARDCODE_3_NET_TRANSFER_BAJO",
+    }
+)
+
 BREAKDOWN_ORDER = (
     "CORTE POR CIUDAD BLOQUEADA",
     "CORTE POR PRODUCTO RACKEADO 444",
     "CORTE POR STOCK",
+    "OK MANUAL POR FORECAST 0",
     "OK COMPLETO POR FOUNTAIN9",
     "OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444",
     "OK PARCIAL - CORTE POR STOCK",
@@ -192,6 +201,7 @@ INPUT_PLAN_COLUMNS = (
 
 PLANNING_REASON_COLUMN = "PLANNING_REASON"
 PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9"
+PLANNING_REASON_MANUAL_FORECAST_ZERO = "MANUAL POR FORECAST 0"
 PLANNING_REASON_AVL = "CUBRIR AVL"
 PLANNING_REASON_PREVENTIVE = "EVITAR QUIEBRES"
 PLANNING_REASON_INSUMOS = "INSUMOS"
@@ -1175,6 +1185,25 @@ def attach_consolidated_input_to_result(
         if source["NET_TRANSFER_HARDCODE_3"]:
             row["MOV_ORIGINAL"] = source["ROQ_INPUT"]
             row["REGLA_DEMANDA"] = "HARDCODE_3_NET_TRANSFER_BAJO"
+
+    manual_keys = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        for row in result.base_rows
+        if row.get("REGLA_DEMANDA") in MANUAL_FORECAST_ZERO_RULES
+    }
+    for allocation in result.allocation_rows:
+        key = (
+            allocation["WAREHOUSE_DESTINATION"],
+            allocation["RETAIL_ID"],
+        )
+        if (
+            key in manual_keys
+            and allocation.get(PLANNING_REASON_COLUMN)
+            == PLANNING_REASON_FOUNTAIN9
+        ):
+            allocation[PLANNING_REASON_COLUMN] = (
+                PLANNING_REASON_MANUAL_FORECAST_ZERO
+            )
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2264,8 +2293,8 @@ def apply_reporting_labels(result) -> None:
         if row.get("TIPO_DE_CORTE") == "SIN DEMANDA":
             row["TIPO_DE_CORTE"] = "SIN RECOMENDACIÓN"
 
+        demand_rule = row.get("REGLA_DEMANDA")
         cut_label_map = {
-            "OK": "OK COMPLETO POR FOUNTAIN9",
             "SIN RUTA DE COSTOS": "CORTE POR RUTA DE COSTOS",
             "BLOQUEO REGIONAL": "CORTE POR BLOQUEO REGIONAL",
             "OK PARCIAL - BLOQUEO REGIONAL": (
@@ -2273,7 +2302,13 @@ def apply_reporting_labels(result) -> None:
             ),
         }
         current_cut = row.get("TIPO_DE_CORTE")
-        if current_cut in cut_label_map:
+        if current_cut == "OK":
+            row["TIPO_DE_CORTE"] = (
+                "OK MANUAL POR FORECAST 0"
+                if demand_rule in MANUAL_FORECAST_ZERO_RULES
+                else "OK COMPLETO POR FOUNTAIN9"
+            )
+        elif current_cut in cut_label_map:
             row["TIPO_DE_CORTE"] = cut_label_map[current_cut]
 
         detail = row.get("DETALLE_MOTIVO")
@@ -2282,7 +2317,6 @@ def apply_reporting_labels(result) -> None:
                 "Sin demanda", "Sin recomendación"
             )
 
-        demand_rule = row.get("REGLA_DEMANDA")
         if isinstance(demand_rule, str):
             row["REGLA_DEMANDA"] = demand_rule.replace(
                 "SIN_DEMANDA", "SIN_RECOMENDACION"
