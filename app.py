@@ -190,6 +190,13 @@ INPUT_PLAN_COLUMNS = (
     "Net Inter-Store Transfers",
 )
 
+PLANNING_REASON_COLUMN = "PLANNING_REASON"
+PLANNING_REASON_FOUNTAIN9 = "FOUNTAIN9"
+PLANNING_REASON_AVL = "CUBRIR AVL"
+PLANNING_REASON_PREVENTIVE = "EVITAR QUIEBRES"
+PLANNING_REASON_INSUMOS = "INSUMOS"
+BULK_OUTPUT_COLUMNS = [*engine.OUTPUT_COLUMNS, PLANNING_REASON_COLUMN]
+
 INSUMOS_COLUMNS = [
     "WAREHOUSE_DESTINATION",
     "WAREHOUSE_SOURCE",
@@ -1347,6 +1354,7 @@ def load_insumos_rows(
                     "CITY": store.get("city", ""),
                     "STORAGE": resolved_storage(catalogs.storage.get(sku)),
                     "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                    PLANNING_REASON_COLUMN: PLANNING_REASON_INSUMOS,
                 }
             )
     finally:
@@ -1403,7 +1411,7 @@ def append_insumos_to_bulk_444(
     engine.write_csv(
         bulk_path,
         regular_444_rows + selected,
-        engine.OUTPUT_COLUMNS,
+        BULK_OUTPUT_COLUMNS,
     )
     summary.update(
         {
@@ -1415,6 +1423,27 @@ def append_insumos_to_bulk_444(
         }
     )
     return summary
+
+
+def rewrite_bulk_csvs_with_planning_reason(
+    local_files: list[Path],
+    result,
+) -> None:
+    """Agrega el origen de planeación únicamente a los CSV operativos Bulk."""
+    rows_by_source: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for row in result.allocation_rows:
+        rows_by_source[int(row["WAREHOUSE_SOURCE"])].append(row)
+
+    for path in local_files:
+        match = re.fullmatch(r"BulkCD_(\d+)\.csv", path.name, flags=re.IGNORECASE)
+        if match is None:
+            continue
+        source = int(match.group(1))
+        engine.write_csv(
+            path,
+            rows_by_source.get(source, []),
+            BULK_OUTPUT_COLUMNS,
+        )
 
 
 def render_database_health(health: dict[str, Any]) -> None:
@@ -2678,6 +2707,11 @@ def apply_avl_fill(
                     "CITY": city,
                     "STORAGE": resolved_storage(catalogs.storage.get(sku)),
                     "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                    PLANNING_REASON_COLUMN: (
+                        PLANNING_REASON_AVL
+                        if candidate_mode == "stockout"
+                        else PLANNING_REASON_PREVENTIVE
+                    ),
                 }
             )
 
@@ -3470,6 +3504,8 @@ def execute_planning(
         )
 
         result = engine.plan_transfers(active_plan_rows, catalogs, config)
+        for allocation in result.allocation_rows:
+            allocation[PLANNING_REASON_COLUMN] = PLANNING_REASON_FOUNTAIN9
         result.warnings.extend(plan_read.warnings)
         fountain_recommended_keys = {
             (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
@@ -3572,6 +3608,7 @@ def execute_planning(
             output_dir,
         )
         local_files = [Path(path) for path in local_files]
+        rewrite_bulk_csvs_with_planning_reason(local_files, result)
         insumos_summary = append_insumos_to_bulk_444(
             local_files,
             result,
