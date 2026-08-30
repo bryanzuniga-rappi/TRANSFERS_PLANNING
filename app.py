@@ -4214,9 +4214,9 @@ def main() -> None:
     st.markdown(
         """
         <section class="hero">
-            <span class="hero-kicker">ABASTO / MX / WEB</span>
+            <span class="hero-kicker">Turbo MX</span>
             <h1>TRANSFER<br>PLANNER.</h1>
-            <p>Sube el requerimiento diario, define los orígenes y ejecuta el mismo motor sin editar código. La base se consulta y valida automáticamente.</p>
+            <p>Sube el export de Fountain9 para que asigne el inventario dado el mejor site. Este modelo no hace calculos sobre la necesidad original de Fountain9, para sugeridos, forecast, envíos, siempre usar la funete original</p>
         </section>
         """,
         unsafe_allow_html=True,
