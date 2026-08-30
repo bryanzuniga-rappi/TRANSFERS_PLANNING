@@ -8,6 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 import html
 import io
+import math
 import re
 import shutil
 import tempfile
@@ -38,6 +39,7 @@ ORIGIN_WAREHOUSES = {
 ALEPH_SHEETS = {
     "NO_DISPONIBLE",
     "STOCK",
+    "INSUMOS",
     "GOLDEN_INFALTABLES",
     "TIENDA",
     "STORAGE",
@@ -54,6 +56,7 @@ REQUIRED_DATABASE_SHEETS = (
     "COPERNICO",
     "NO_DISPONIBLE",
     "STOCK",
+    "INSUMOS",
     "GOLDEN_INFALTABLES",
     "TIENDA",
     "STORAGE",
@@ -99,6 +102,11 @@ SHEET_DESCRIPTIONS = {
         "Stock disponible final por warehouse y producto. Es la fuente mandante "
         "para determinar cuánto puede enviarse."
     ),
+    "INSUMOS": (
+        "Cantidades de insumos calculadas automáticamente por Aleph para cada "
+        "tienda. Solo se anexan al BulkCD_444 cuando la tienda ya recibe producto "
+        "normal desde ese mismo origen."
+    ),
     "GOLDEN_INFALTABLES": (
         "Productos Golden e Infaltables definidos por producto y ciudad, con "
         "prioridad y excepciones especiales de negocio."
@@ -118,6 +126,16 @@ DEMAND_RULE_LABELS = {
     "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": "ROQ 0 · INVENTARIO MENOR A DEMANDA",
     "SIN_DEMANDA": "SIN RECOMENDACIÓN",
 }
+
+INSUMOS_COLUMNS = [
+    "WAREHOUSE_DESTINATION",
+    "WAREHOUSE_SOURCE",
+    "RETAIL_ID",
+    "QUANTITY",
+    "PLANNED_DATE",
+    "ROUTE",
+    "DELIVERY_PRIORITY",
+]
 
 CITY_DISPLAY_NAMES = {
     "CDMX": "Ciudad de México",
@@ -717,6 +735,145 @@ def save_database(workbook_bytes: bytes, destination: Path) -> None:
         handle.write(workbook_bytes)
 
 
+def load_insumos_rows(
+    database_path: Path,
+    catalogs,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Lee INSUMOS tal como lo entrega Aleph; no recalcula sus cantidades."""
+    rows: list[dict[str, Any]] = []
+    warnings: list[str] = []
+    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
+    try:
+        for sheet_row, record in enumerate(
+            engine.iter_sheet_records(
+                workbook,
+                "INSUMOS",
+                INSUMOS_COLUMNS,
+                INSUMOS_COLUMNS,
+            ),
+            start=14,
+        ):
+            destination = engine.to_id(
+                record["WAREHOUSE_DESTINATION"],
+                f"INSUMOS fila {sheet_row}.WAREHOUSE_DESTINATION",
+                allow_none=True,
+            )
+            source = engine.to_id(
+                record["WAREHOUSE_SOURCE"],
+                f"INSUMOS fila {sheet_row}.WAREHOUSE_SOURCE",
+                allow_none=True,
+            )
+            sku = engine.to_id(
+                record["RETAIL_ID"],
+                f"INSUMOS fila {sheet_row}.RETAIL_ID",
+                allow_none=True,
+            )
+            quantity_value = engine.to_float(record["QUANTITY"], 0.0)
+
+            if destination is None or source is None or sku is None:
+                warnings.append(
+                    f"INSUMOS fila {sheet_row}: se omitió por tener identificadores vacíos."
+                )
+                continue
+            if quantity_value <= 0:
+                continue
+            if not math.isclose(
+                quantity_value,
+                round(quantity_value),
+                abs_tol=1e-6,
+            ):
+                raise ValueError(
+                    f"INSUMOS fila {sheet_row}: QUANTITY debe ser entera; "
+                    f"se recibió {quantity_value!r}."
+                )
+            if source != 444:
+                warnings.append(
+                    f"INSUMOS fila {sheet_row}: se omitió el origen {source}; "
+                    "los insumos solo pueden salir del warehouse 444."
+                )
+                continue
+
+            store = catalogs.stores.get(destination, {})
+            rows.append(
+                {
+                    "WAREHOUSE_DESTINATION": destination,
+                    "WAREHOUSE_SOURCE": 444,
+                    "RETAIL_ID": sku,
+                    "QUANTITY": int(round(quantity_value)),
+                    "PLANNED_DATE": "",
+                    "ROUTE": 1,
+                    "DELIVERY_PRIORITY": 1,
+                    "CITY": store.get("city", ""),
+                    "STORAGE": catalogs.storage.get(sku, "UNKNOWN"),
+                    "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                }
+            )
+    finally:
+        workbook.close()
+    return rows, warnings
+
+
+def append_insumos_to_bulk_444(
+    local_files: list[Path],
+    result,
+    insumos_rows: list[dict[str, Any]],
+    origins: tuple[int, ...],
+) -> dict[str, Any]:
+    """Anexa insumos sin modificar stock, capacidad ni el contador de tareas."""
+    summary = {
+        "enabled": 444 in origins,
+        "source_rows": len(insumos_rows),
+        "eligible_stores": 0,
+        "lines_added": 0,
+        "units_added": 0,
+        "stores_added": 0,
+    }
+    if 444 not in origins:
+        return summary
+
+    regular_444_rows = [
+        row
+        for row in result.allocation_rows
+        if row["WAREHOUSE_SOURCE"] == 444 and row["QUANTITY"] > 0
+    ]
+    eligible_destinations = {
+        row["WAREHOUSE_DESTINATION"] for row in regular_444_rows
+    }
+    summary["eligible_stores"] = len(eligible_destinations)
+    selected = [
+        row
+        for row in insumos_rows
+        if row["WAREHOUSE_DESTINATION"] in eligible_destinations
+    ]
+    if not selected:
+        return summary
+
+    bulk_path = next(
+        (path for path in local_files if path.name.lower() == "bulkcd_444.csv"),
+        None,
+    )
+    if bulk_path is None:
+        raise RuntimeError(
+            "Se encontraron insumos elegibles, pero no se generó BulkCD_444.csv."
+        )
+
+    engine.write_csv(
+        bulk_path,
+        regular_444_rows + selected,
+        engine.OUTPUT_COLUMNS,
+    )
+    summary.update(
+        {
+            "lines_added": len(selected),
+            "units_added": sum(row["QUANTITY"] for row in selected),
+            "stores_added": len(
+                {row["WAREHOUSE_DESTINATION"] for row in selected}
+            ),
+        }
+    )
+    return summary
+
+
 def render_database_health(health: dict[str, Any]) -> None:
     online = health["online"]
     css_class = "online" if online else "review"
@@ -795,6 +952,10 @@ def percentage(numerator: float, denominator: float) -> float:
 def build_planning_analytics(result) -> dict[str, Any]:
     base_rows = result.base_rows
     allocation_rows = result.allocation_rows
+
+    def original_roq_units(row: dict[str, Any]) -> int:
+        return max(int(math.ceil(max(float(row["MOV_ORIGINAL"]), 0.0))), 0)
+
     eligible_rows = [row for row in base_rows if row["CANTIDAD_OBJETIVO"] > 0]
     assigned_rows = [row for row in eligible_rows if row["CANTIDAD_ASIGNADA"] > 0]
     fully_covered_rows = [
@@ -907,6 +1068,9 @@ def build_planning_analytics(result) -> dict[str, Any]:
             "cases": 0,
             "served": 0,
             "full": 0,
+            "original_roq_units": 0,
+            "hardcode_target_units": 0,
+            "hardcode_assigned_units": 0,
             "target_units": 0,
             "assigned_units": 0,
         }
@@ -916,9 +1080,15 @@ def build_planning_analytics(result) -> dict[str, Any]:
         data = rule_accumulators[rule]
         target = int(row["CANTIDAD_OBJETIVO"])
         assigned = int(row["CANTIDAD_ASIGNADA"])
+        original_roq = original_roq_units(row)
+        hardcode_target = max(target - original_roq, 0)
+        hardcode_assigned = max(assigned - original_roq, 0)
         data["cases"] += 1
         data["served"] += int(assigned > 0)
         data["full"] += int(target > 0 and assigned >= target)
+        data["original_roq_units"] += original_roq
+        data["hardcode_target_units"] += hardcode_target
+        data["hardcode_assigned_units"] += hardcode_assigned
         data["target_units"] += target
         data["assigned_units"] += assigned
 
@@ -933,9 +1103,16 @@ def build_planning_analytics(result) -> dict[str, Any]:
                 "CASOS": int(data["cases"]),
                 "CASOS_CON_ENVIO": int(data["served"]),
                 "COBERTURA_COMPLETA": int(data["full"]),
+                "UNIDADES_ROQ_ORIGINAL": int(data["original_roq_units"]),
+                "INCREMENTO_HARDCODE_OBJETIVO": int(
+                    data["hardcode_target_units"]
+                ),
+                "INCREMENTO_HARDCODE_ENVIADO": int(
+                    data["hardcode_assigned_units"]
+                ),
                 "UNIDADES_OBJETIVO": int(data["target_units"]),
                 "UNIDADES_ASIGNADAS": int(data["assigned_units"]),
-                "FILL_RATE_%": percentage(
+                "COMPLIANCE_UNIDADES_%": percentage(
                     data["assigned_units"], data["target_units"]
                 ),
             }
@@ -1018,6 +1195,23 @@ def build_planning_analytics(result) -> dict[str, Any]:
 
     target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in eligible_rows)
     assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in eligible_rows)
+    original_roq_total = sum(original_roq_units(row) for row in eligible_rows)
+    original_roq_fulfilled = sum(
+        min(int(row["CANTIDAD_ASIGNADA"]), original_roq_units(row))
+        for row in eligible_rows
+    )
+    hardcode_target_units = sum(
+        max(int(row["CANTIDAD_OBJETIVO"]) - original_roq_units(row), 0)
+        for row in eligible_rows
+    )
+    hardcode_assigned_units = sum(
+        max(int(row["CANTIDAD_ASIGNADA"]) - original_roq_units(row), 0)
+        for row in eligible_rows
+    )
+    hardcode_cases = sum(
+        int(row["CANTIDAD_OBJETIVO"]) > original_roq_units(row)
+        for row in eligible_rows
+    )
     return {
         "city_rows": city_rows,
         "store_rows": store_rows,
@@ -1031,7 +1225,19 @@ def build_planning_analytics(result) -> dict[str, Any]:
             "not_assigned_cases": len(not_assigned_rows),
             "target_units": target_units,
             "assigned_units": assigned_units,
-            "fill_rate_pct": percentage(assigned_units, target_units),
+            "case_compliance_pct": percentage(
+                len(fully_covered_rows), len(eligible_rows)
+            ),
+            "case_service_pct": percentage(len(assigned_rows), len(eligible_rows)),
+            "unit_compliance_pct": percentage(assigned_units, target_units),
+            "original_roq_units": original_roq_total,
+            "original_roq_fulfilled_units": original_roq_fulfilled,
+            "original_roq_compliance_pct": percentage(
+                original_roq_fulfilled, original_roq_total
+            ),
+            "hardcode_cases": hardcode_cases,
+            "hardcode_target_units": hardcode_target_units,
+            "hardcode_assigned_units": hardcode_assigned_units,
             "m3_assigned": round(
                 sum(float(row["M3_ASIGNADO"]) for row in assigned_rows), 3
             ),
@@ -1190,6 +1396,13 @@ def execute_planning(
     captured = io.StringIO()
     with redirect_stdout(captured):
         catalogs = engine.load_catalogs(data_path, config)
+        insumos_rows: list[dict[str, Any]] = []
+        if 444 in origins:
+            insumos_rows, insumos_warnings = load_insumos_rows(
+                data_path,
+                catalogs,
+            )
+            catalogs.warnings.extend(insumos_warnings)
         plan_read = engine.read_plan_csv(plan_path, config)
         active_plan_rows, blocked_plan_rows = split_plan_rows_by_blocked_city(
             plan_read.rows,
@@ -1228,11 +1441,24 @@ def execute_planning(
             plan_path.name,
             output_dir,
         )
+        local_files = [Path(path) for path in local_files]
+        insumos_summary = append_insumos_to_bulk_444(
+            local_files,
+            result,
+            insumos_rows,
+            origins,
+        )
         print(f"Requerimientos activos: {len(active_plan_rows):,}")
         print(f"Requerimientos excluidos por ciudad: {len(blocked_plan_rows):,}")
         print(f"Tareas generadas: {result.tasks_used:,}")
+        if insumos_summary["enabled"]:
+            print(
+                "Insumos agregados a BulkCD_444: "
+                f"{insumos_summary['lines_added']:,} líneas / "
+                f"{insumos_summary['units_added']:,} unidades / "
+                f"{insumos_summary['stores_added']:,} tiendas"
+            )
 
-    local_files = [Path(path) for path in local_files]
     zip_path = create_zip(
         local_files,
         workspace / f"Planeacion_{run_date:%d-%m-%Y}.zip",
@@ -1253,6 +1479,7 @@ def execute_planning(
         "origins": list(origins),
         "analytics": analytics,
         "city_block": block_summary,
+        "insumos": insumos_summary,
     }
 
 
@@ -1326,12 +1553,50 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
     st.markdown(
         """
         <div class="report-note">
-            Un caso representa una combinación tienda–SKU. “Con envío” significa que se
-            asignó al menos una unidad; “cobertura completa” significa que se cubrió toda
-            la cantidad objetivo calculada por el modelo.
+            Un caso representa una combinación tienda–SKU. COMPLIANCE DE CASOS mide
+            cuántos casos se cubrieron al 100%; COMPLIANCE DE UNIDADES compara lo
+            asignado contra el objetivo final del modelo. El incremento por hardcode se
+            presenta separado del ROQ original para no inflar artificialmente el
+            cumplimiento.
         </div>
         """,
         unsafe_allow_html=True,
+    )
+
+    cases_1, cases_2, cases_3, cases_4 = st.columns(4)
+    cases_1.metric("CASOS CON RECOMENDACIÓN", f"{summary['eligible_cases']:,}")
+    cases_2.metric("CUBIERTOS AL 100%", f"{summary['fully_covered_cases']:,}")
+    cases_3.metric("COBERTURA PARCIAL", f"{summary['partial_cases']:,}")
+    cases_4.metric("CASOS SIN ENVÍO", f"{summary['not_assigned_cases']:,}")
+
+    compliance_1, compliance_2, compliance_3, compliance_4 = st.columns(4)
+    compliance_1.metric(
+        "COMPLIANCE DE CASOS", f"{summary['case_compliance_pct']:,.1f}%"
+    )
+    compliance_2.metric(
+        "CASOS CON ALGÚN ENVÍO", f"{summary['case_service_pct']:,.1f}%"
+    )
+    compliance_3.metric(
+        "COMPLIANCE DE UNIDADES", f"{summary['unit_compliance_pct']:,.1f}%"
+    )
+    compliance_4.metric(
+        "COMPLIANCE DEL ROQ ORIGINAL",
+        f"{summary['original_roq_compliance_pct']:,.1f}%",
+    )
+
+    hardcode_1, hardcode_2, hardcode_3, hardcode_4 = st.columns(4)
+    hardcode_1.metric("CASOS CON HARDCODE", f"{summary['hardcode_cases']:,}")
+    hardcode_2.metric(
+        "OBJETIVO AÑADIDO POR HARDCODE",
+        f"{summary['hardcode_target_units']:,}",
+    )
+    hardcode_3.metric(
+        "INCREMENTO HARDCODE ENVIADO",
+        f"{summary['hardcode_assigned_units']:,}",
+    )
+    hardcode_4.metric(
+        "UNIDADES FORECAST 0",
+        f"{summary['forecast_zero_assigned_units']:,}",
     )
 
     stockout_1, stockout_2, stockout_3, stockout_4 = st.columns(4)
@@ -1342,42 +1607,34 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
         "SKUs STOCKOUT ATENDIDOS", f"{summary['stockout_products_served']:,}"
     )
     stockout_3.metric(
-        "FORECAST 0 FORZADOS", f"{summary['forecast_zero_forced_cases']:,}"
+        "STOCKOUTS CUBIERTOS 100%", f"{summary['stockout_cases_full']:,}"
     )
     stockout_4.metric(
-        "UNIDADES FORECAST 0",
-        f"{summary['forecast_zero_assigned_units']:,}",
+        "FORECAST 0 FORZADOS", f"{summary['forecast_zero_forced_cases']:,}"
     )
-
-    coverage_1, coverage_2, coverage_3, coverage_4 = st.columns(4)
-    coverage_1.metric(
-        "COBERTURA COMPLETA", f"{summary['fully_covered_cases']:,}"
-    )
-    coverage_2.metric("COBERTURA PARCIAL", f"{summary['partial_cases']:,}")
-    coverage_3.metric("CASOS SIN ENVÍO", f"{summary['not_assigned_cases']:,}")
-    coverage_4.metric("FILL RATE UNIDADES", f"{summary['fill_rate_pct']:,.1f}%")
 
     special_1, special_2, special_3, special_4 = st.columns(4)
     special_1.metric(
-        "STOCKOUTS CUBIERTOS 100%", f"{summary['stockout_cases_full']:,}"
-    )
-    special_2.metric(
         "INVENTARIO < DEMANDA · FORZADOS",
         f"{summary['deficit_forced_cases']:,}",
     )
-    special_3.metric(
+    special_2.metric(
         "MÍNIMO DE 3 APLICADO", f"{summary['minimum_three_cases']:,}"
     )
-    special_4.metric(
+    special_3.metric(
         "GOLDEN CON ENVÍO", f"{summary['golden_served_cases']:,}"
+    )
+    special_4.metric(
+        "UNIDADES ROQ ORIGINAL",
+        f"{summary['original_roq_units']:,}",
     )
 
     st.markdown('<span class="section-label">REGLAS DE DEMANDA</span>', unsafe_allow_html=True)
     report_table(
         analytics["rule_rows"],
         column_config={
-            "FILL_RATE_%": st.column_config.NumberColumn(
-                "FILL RATE %", format="%.1f%%"
+            "COMPLIANCE_UNIDADES_%": st.column_config.NumberColumn(
+                "COMPLIANCE UNIDADES %", format="%.1f%%"
             ),
         },
         max_height=360,
@@ -1409,10 +1666,22 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
 
 def render_results(run: dict[str, Any]) -> None:
     st.markdown('<div class="result-title">PLANEACIÓN LISTA.</div>', unsafe_allow_html=True)
-    col1, col2, col3 = st.columns(3)
+    col1, col2, col3, col4 = st.columns(4)
     col1.metric("REQUERIMIENTOS", f"{run['requirements']:,}")
-    col2.metric("TAREAS", f"{run['tasks']:,}")
-    col3.metric("UNIDADES", f"{run['units']:,}")
+    col2.metric("TAREAS DE ABASTO", f"{run['tasks']:,}")
+    col3.metric("UNIDADES DE ABASTO", f"{run['units']:,}")
+    col4.metric(
+        "UNIDADES DE INSUMOS",
+        f"{run.get('insumos', {}).get('units_added', 0):,}",
+    )
+
+    insumos = run.get("insumos", {})
+    if insumos.get("lines_added", 0) > 0:
+        st.success(
+            f"Insumos anexados a BulkCD_444: {insumos['lines_added']:,} líneas, "
+            f"{insumos['units_added']:,} unidades y "
+            f"{insumos['stores_added']:,} tiendas. No consumen tareas del modelo."
+        )
 
     city_block = run.get("city_block", {})
     if city_block.get("requirements", 0) > 0:
