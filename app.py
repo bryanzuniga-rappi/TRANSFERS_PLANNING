@@ -18,6 +18,20 @@ import zipfile
 
 import openpyxl
 import streamlit as st
+from reportlab.lib import colors as pdf_colors
+from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.pagesizes import A4, landscape
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
+from reportlab.lib.units import mm
+from reportlab.platypus import (
+    KeepTogether,
+    PageBreak,
+    Paragraph,
+    SimpleDocTemplate,
+    Spacer,
+    Table,
+    TableStyle,
+)
 
 import modelo_abasto as engine
 
@@ -37,6 +51,7 @@ ORIGIN_WAREHOUSES = {
 }
 
 ALEPH_SHEETS = {
+    "CATALOGO",
     "NO_DISPONIBLE",
     "STOCK",
     "INSUMOS",
@@ -57,6 +72,7 @@ REQUIRED_DATABASE_SHEETS = (
     "RACKEADOS",
     "CAP_RECIBO",
     "COPERNICO",
+    "CATALOGO",
     "NO_DISPONIBLE",
     "STOCK",
     "INSUMOS",
@@ -102,6 +118,11 @@ SHEET_DESCRIPTIONS = {
         "Inventario detallado por ubicación del warehouse 444. Permite identificar "
         "y descontar el stock no utilizable."
     ),
+    "CATALOGO": (
+        "Catálogo de surtido por tienda y producto con su ADU. Se utiliza para "
+        "detectar oportunidades de stockout y completar tareas disponibles mediante "
+        "la cobertura AVL opcional."
+    ),
     "NO_DISPONIBLE": (
         "Stock no disponible por warehouse y producto que debe descontarse del "
         "inventario disponible final."
@@ -133,7 +154,28 @@ DEMAND_RULE_LABELS = {
     "HARDCODE_4_CERO_TOTAL": "FORECAST 0 · FORZADO A 4",
     "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": "ROQ 0 · INVENTARIO MENOR A DEMANDA",
     "SIN_DEMANDA": "SIN RECOMENDACIÓN",
+    "AVL_DOH": "COBERTURA AVL POR DOH",
 }
+
+BREAKDOWN_ORDER = (
+    "CORTE POR CIUDAD BLOQUEADA",
+    "CORTE POR PRODUCTO RACKEADO 444",
+    "CORTE POR STOCK",
+    "OK COMPLETO POR FOUNTAIN9",
+    "OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444",
+    "OK PARCIAL - CORTE POR STOCK",
+    "ENVIADOS PARA CUBRIR AVL",
+    "SIN RECOMENDACIÓN",
+    "CORTE POR RUTA DE COSTOS",
+    "CORTE POR TIENDA CERRADA",
+    "INSUMOS",
+    "CORTE POR CAPACIDAD DE TIENDA",
+    "CORTE POR CAPACIDAD DE TAREAS",
+    "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS",
+    "CORTE POR BLOQUEO REGIONAL",
+    "OK PARCIAL - CORTE POR BLOQUEO REGIONAL",
+    "ERROR DE DATOS",
+)
 
 INSUMOS_COLUMNS = [
     "WAREHOUSE_DESTINATION",
@@ -905,6 +947,60 @@ def load_closed_store_ids(database_path: Path) -> set[int]:
     return closed_stores
 
 
+def load_avl_catalog_rows(
+    database_path: Path,
+) -> tuple[list[dict[str, Any]], list[str]]:
+    """Carga todo el catálogo y consolida una ADU por combinación tienda-SKU."""
+    consolidated: dict[tuple[int, int], float] = {}
+    warnings: list[str] = []
+    workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
+    try:
+        for record in engine.iter_sheet_records(
+            workbook,
+            "CATALOGO",
+            ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
+            ["WAREHOUSE_ID", "PRODUCT_ID", "ADU"],
+        ):
+            destination = engine.to_id(
+                record["WAREHOUSE_ID"],
+                "CATALOGO.WAREHOUSE_ID",
+                allow_none=True,
+            )
+            sku = engine.to_id(
+                record["PRODUCT_ID"],
+                "CATALOGO.PRODUCT_ID",
+                allow_none=True,
+            )
+            adu = max(engine.to_float(record["ADU"], 0.0), 0.0)
+            if destination is None or sku is None or adu <= 0:
+                continue
+            key = (destination, sku)
+            if key in consolidated and not math.isclose(
+                consolidated[key], adu, abs_tol=1e-9
+            ):
+                previous = consolidated[key]
+                consolidated[key] = max(previous, adu)
+                if len(warnings) < 20:
+                    warnings.append(
+                        f"CATALOGO: {key} tiene ADU {previous} y {adu}; "
+                        f"se usó la mayor ({consolidated[key]})."
+                    )
+            else:
+                consolidated[key] = adu
+    finally:
+        workbook.close()
+
+    rows = [
+        {
+            "WAREHOUSE_DESTINATION": destination,
+            "RETAIL_ID": sku,
+            "ADU": adu,
+        }
+        for (destination, sku), adu in consolidated.items()
+    ]
+    return rows, warnings
+
+
 def load_insumos_rows(
     database_path: Path,
     catalogs,
@@ -1103,6 +1199,20 @@ def create_zip(paths: list[Path], destination: Path) -> Path:
         for path in paths:
             archive.write(path, arcname=path.name)
     return destination
+
+
+def ordered_breakdown_rows(
+    status_counts: dict[str, int] | Counter[str],
+) -> list[dict[str, Any]]:
+    order = {label: index for index, label in enumerate(BREAKDOWN_ORDER)}
+    return [
+        {"BREAKDOWN": status, "FILAS": int(count)}
+        for status, count in sorted(
+            status_counts.items(),
+            key=lambda item: (order.get(item[0], len(order)), item[0]),
+        )
+        if count
+    ]
 
 
 def clear_previous_workspace() -> None:
@@ -1642,6 +1752,18 @@ def apply_reporting_labels(result) -> None:
         if row.get("TIPO_DE_CORTE") == "SIN DEMANDA":
             row["TIPO_DE_CORTE"] = "SIN RECOMENDACIÓN"
 
+        cut_label_map = {
+            "OK": "OK COMPLETO POR FOUNTAIN9",
+            "SIN RUTA DE COSTOS": "CORTE POR RUTA DE COSTOS",
+            "BLOQUEO REGIONAL": "CORTE POR BLOQUEO REGIONAL",
+            "OK PARCIAL - BLOQUEO REGIONAL": (
+                "OK PARCIAL - CORTE POR BLOQUEO REGIONAL"
+            ),
+        }
+        current_cut = row.get("TIPO_DE_CORTE")
+        if current_cut in cut_label_map:
+            row["TIPO_DE_CORTE"] = cut_label_map[current_cut]
+
         detail = row.get("DETALLE_MOTIVO")
         if isinstance(detail, str):
             row["DETALLE_MOTIVO"] = detail.replace("MOV", "ROQ").replace(
@@ -1759,6 +1881,810 @@ def city_block_summary(
     }
 
 
+def empty_avl_summary(enabled: bool, doh: float) -> dict[str, Any]:
+    return {
+        "enabled": enabled,
+        "doh": float(doh),
+        "catalog_rows": 0,
+        "stockout_candidates": 0,
+        "cases_sent": 0,
+        "cases_full": 0,
+        "cases_partial": 0,
+        "tasks_added": 0,
+        "units_added": 0,
+        "m3_added": 0.0,
+        "stores": 0,
+        "products": 0,
+        "task_slots_before": 0,
+        "task_slots_after": 0,
+        "skipped_closed_store": 0,
+        "skipped_blocked_city": 0,
+        "skipped_missing_stock": 0,
+        "skipped_not_stockout": 0,
+        "skipped_already_served": 0,
+        "skipped_route_cost": 0,
+        "skipped_capacity": 0,
+        "skipped_no_source_stock": 0,
+    }
+
+
+def apply_avl_fill(
+    result,
+    catalog_rows: list[dict[str, Any]],
+    catalogs,
+    config: engine.Config,
+    closed_store_ids: set[int],
+    blocked_cities: tuple[str, ...],
+    doh: float,
+) -> dict[str, Any]:
+    """Usa tareas remanentes para cubrir stockouts del catálogo por ADU x DOH."""
+    summary = empty_avl_summary(True, doh)
+    summary["catalog_rows"] = len(catalog_rows)
+    summary["task_slots_before"] = max(config.max_tasks - result.tasks_used, 0)
+    for base_row in result.base_rows:
+        base_row.setdefault("ADU_CATALOGO", "")
+        base_row.setdefault("DOH_AVL", "")
+    if doh <= 0 or summary["task_slots_before"] <= 0:
+        summary["task_slots_after"] = summary["task_slots_before"]
+        return summary
+
+    blocked_city_set = set(blocked_cities)
+    assigned_keys = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        for row in result.allocation_rows
+        if int(row.get("QUANTITY", 0) or 0) > 0
+    }
+    base_row_by_key = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row
+        for row in result.base_rows
+    }
+
+    consumed_stock: Counter[tuple[int, int]] = Counter()
+    for allocation in result.allocation_rows:
+        consumed_stock[
+            (allocation["WAREHOUSE_SOURCE"], allocation["RETAIL_ID"])
+        ] += int(allocation["QUANTITY"])
+
+    stock_info_cache: dict[tuple[int, int], dict[str, Any]] = {}
+    stock_remaining: dict[tuple[int, int], int] = {}
+
+    def get_source_stock(source: int, sku: int) -> tuple[dict[str, Any], int]:
+        key = (source, sku)
+        if key not in stock_info_cache:
+            info = engine.source_stock_components(catalogs, source, sku)
+            stock_info_cache[key] = info
+            stock_remaining[key] = max(
+                int(info["adjusted"]) - consumed_stock.get(key, 0),
+                0,
+            )
+        return stock_info_cache[key], stock_remaining[key]
+
+    capacity_by_store = {
+        row["WAREHOUSE_DESTINATION"]: row for row in result.capacity_rows
+    }
+
+    candidates: list[dict[str, Any]] = []
+    for catalog_row in catalog_rows:
+        destination = catalog_row["WAREHOUSE_DESTINATION"]
+        sku = catalog_row["RETAIL_ID"]
+        key = (destination, sku)
+        if destination in closed_store_ids:
+            summary["skipped_closed_store"] += 1
+            continue
+        store = catalogs.stores.get(destination)
+        if not store:
+            continue
+        city_norm = store.get("city_norm", "")
+        if city_norm in blocked_city_set:
+            summary["skipped_blocked_city"] += 1
+            continue
+        if key not in catalogs.stock_base:
+            summary["skipped_missing_stock"] += 1
+            continue
+        if catalogs.stock_base[key] > 0:
+            summary["skipped_not_stockout"] += 1
+            continue
+        summary["stockout_candidates"] += 1
+        if key in assigned_keys:
+            summary["skipped_already_served"] += 1
+            continue
+        if key in catalogs.route_cost_blocks:
+            summary["skipped_route_cost"] += 1
+            continue
+
+        is_golden = bool(city_norm) and (
+            sku,
+            city_norm,
+        ) in catalogs.golden_infaltables
+        candidates.append(
+            {
+                "WAREHOUSE_DESTINATION": destination,
+                "RETAIL_ID": sku,
+                "ADU": float(catalog_row["ADU"]),
+                "STORE": store,
+                "IS_GOLDEN": is_golden,
+                "PRIORITY": catalogs.store_priority.get(destination, 100),
+            }
+        )
+
+    candidates.sort(
+        key=lambda row: (
+            0 if row["IS_GOLDEN"] else 1,
+            row["PRIORITY"],
+            row["WAREHOUSE_DESTINATION"],
+            row["RETAIL_ID"],
+        )
+    )
+
+    stores_sent: set[int] = set()
+    products_sent: set[int] = set()
+    next_order = len(result.base_rows) + 1
+    for candidate in candidates:
+        if result.tasks_used >= config.max_tasks:
+            break
+
+        destination = candidate["WAREHOUSE_DESTINATION"]
+        sku = candidate["RETAIL_ID"]
+        store = candidate["STORE"]
+        city = store.get("city", "")
+        city_norm = store.get("city_norm", "")
+        is_golden = candidate["IS_GOLDEN"]
+        m3_per_unit = catalogs.volume_m3.get(
+            sku,
+            config.default_m3_per_unit,
+        )
+        capacity = catalogs.store_capacity.get(
+            destination,
+            config.default_store_capacity_m3,
+        )
+        capacity_row = capacity_by_store.get(destination)
+        if capacity_row is None:
+            capacity_row = {
+                "WAREHOUSE_DESTINATION": destination,
+                "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+                "CITY": city,
+                "CAPACIDAD_M3": capacity,
+                "M3_CONTABILIZADO_CAPACIDAD": 0.0,
+                "M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN": 0.0,
+                "CAPACIDAD_CERRADA": False,
+                "CAPACIDAD_SUPERADA_POR_LINEA": False,
+            }
+            result.capacity_rows.append(capacity_row)
+            capacity_by_store[destination] = capacity_row
+
+        cap_before = float(capacity_row["M3_CONTABILIZADO_CAPACIDAD"])
+        if not is_golden and bool(capacity_row["CAPACIDAD_CERRADA"]):
+            summary["skipped_capacity"] += 1
+            continue
+
+        target = max(int(math.ceil(candidate["ADU"] * doh)), 3)
+        origin_info: dict[int, dict[str, Any]] = {}
+        origin_before: dict[int, int] = {}
+        regional_blocks: dict[int, bool] = {}
+        candidate_allocations: list[tuple[int, int]] = []
+        remaining_target = target
+        for source in config.origin_warehouses:
+            info, available = get_source_stock(source, sku)
+            origin_info[source] = info
+            origin_before[source] = available
+            regional_block = engine.is_regional_block(
+                catalogs,
+                source,
+                destination,
+                sku,
+                city_norm,
+                is_golden,
+            )
+            regional_blocks[source] = regional_block
+            if regional_block:
+                continue
+            quantity = min(remaining_target, available)
+            if quantity > 0:
+                candidate_allocations.append((source, quantity))
+                remaining_target -= quantity
+            if remaining_target <= 0:
+                break
+
+        for source in config.origin_warehouses:
+            if source in origin_info:
+                continue
+            info, available = get_source_stock(source, sku)
+            origin_info[source] = info
+            origin_before[source] = available
+            regional_blocks[source] = engine.is_regional_block(
+                catalogs,
+                source,
+                destination,
+                sku,
+                city_norm,
+                is_golden,
+            )
+
+        available_task_slots = max(config.max_tasks - result.tasks_used, 0)
+        allocations = candidate_allocations[:available_task_slots]
+        assigned = sum(quantity for _, quantity in allocations)
+        if assigned <= 0:
+            summary["skipped_no_source_stock"] += 1
+            continue
+
+        task_before = result.tasks_used
+        assigned_by_origin = {
+            source: 0 for source in config.origin_warehouses
+        }
+        for source, quantity in allocations:
+            stock_remaining[(source, sku)] -= quantity
+            assigned_by_origin[source] += quantity
+            result.tasks_used += 1
+            result.allocation_rows.append(
+                {
+                    "WAREHOUSE_DESTINATION": destination,
+                    "WAREHOUSE_SOURCE": source,
+                    "RETAIL_ID": sku,
+                    "QUANTITY": int(quantity),
+                    "PLANNED_DATE": "",
+                    "ROUTE": 1,
+                    "DELIVERY_PRIORITY": 1,
+                    "CITY": city,
+                    "STORAGE": catalogs.storage.get(sku, "UNKNOWN"),
+                    "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+                }
+            )
+
+        assigned_m3 = assigned * m3_per_unit
+        capacity_row["M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN"] = (
+            float(capacity_row["M3_TOTAL_ASIGNADO_INCLUYE_GOLDEN"])
+            + assigned_m3
+        )
+        if not is_golden:
+            cap_after = cap_before + assigned_m3
+            capacity_row["M3_CONTABILIZADO_CAPACIDAD"] = cap_after
+            if cap_after >= capacity:
+                capacity_row["CAPACIDAD_CERRADA"] = True
+            if cap_after > capacity:
+                capacity_row["CAPACIDAD_SUPERADA_POR_LINEA"] = True
+        else:
+            cap_after = cap_before
+
+        previous_row = base_row_by_key.get((destination, sku))
+        report_row: dict[str, Any] = {
+            "ORDEN_PLANIFICACION": next_order,
+            "FILA_INPUT": previous_row.get("FILA_INPUT", "CATALOGO")
+            if previous_row
+            else "CATALOGO",
+            "FILAS_INPUT_CONSOLIDADAS": previous_row.get(
+                "FILAS_INPUT_CONSOLIDADAS", "CATALOGO"
+            )
+            if previous_row
+            else "CATALOGO",
+            "CANTIDAD_FILAS_INPUT": previous_row.get("CANTIDAD_FILAS_INPUT", 0)
+            if previous_row
+            else 0,
+            "DUPLICADO_CONFLICTIVO": False,
+            "WAREHOUSE_DESTINATION": destination,
+            "WAREHOUSE_NAME": store.get("warehouse_name", ""),
+            "CITY": city,
+            "RETAIL_ID": sku,
+            "SKU_NAME": previous_row.get("SKU_NAME", "") if previous_row else "",
+            "PREDICTED_OPENING_INVENTORY": previous_row.get(
+                "PREDICTED_OPENING_INVENTORY", 0
+            )
+            if previous_row
+            else 0,
+            "PREDICTED_DEMAND": previous_row.get("PREDICTED_DEMAND", 0)
+            if previous_row
+            else 0,
+            "CURRENT_INVENTORY": catalogs.stock_base.get((destination, sku), 0),
+            "MOV_ORIGINAL": 0,
+            "REGLA_DEMANDA": "AVL_DOH",
+            "ADU_CATALOGO": candidate["ADU"],
+            "DOH_AVL": doh,
+            "CANTIDAD_OBJETIVO": target,
+            "CANTIDAD_ASIGNADA": assigned,
+            "CANTIDAD_FALTANTE": max(target - assigned, 0),
+            "ES_GOLDEN_INFALTABLE": is_golden,
+            "PRIORIDAD_TIENDA": candidate["PRIORITY"],
+            "ES_STOCKOUT": True,
+            "SIN_RUTA_COSTOS": False,
+            "M3_POR_UNIDAD": m3_per_unit,
+            "M3_OBJETIVO": target * m3_per_unit,
+            "M3_ASIGNADO": assigned_m3,
+            "CAPACIDAD_TIENDA_M3": capacity,
+            "M3_CAPACIDAD_ANTES": cap_before,
+            "M3_CAPACIDAD_DESPUES": cap_after,
+            "EXCEDE_CAPACIDAD_EN_ESTA_LINEA": (
+                not is_golden and cap_after > capacity
+            ),
+            "PASA_CAPACIDAD": True,
+            "TAREAS_ANTES": task_before,
+            "TAREAS_GENERADAS": len(allocations),
+            "TAREAS_ACUMULADAS": result.tasks_used,
+            "PASA_TAREAS": len(allocations) == len(candidate_allocations),
+            "ORIGENES_USADOS": " | ".join(
+                f"{source}:{quantity}" for source, quantity in allocations
+            ),
+            "STORAGE": catalogs.storage.get(sku, "UNKNOWN"),
+            "VALUE": catalogs.high_value.get(sku, "REGULAR"),
+            "TIPO_DE_CORTE": "ENVIADOS PARA CUBRIR AVL",
+            "DETALLE_MOTIVO": (
+                f"Stockout en destino; cobertura de {doh:g} DOH con "
+                f"ADU {candidate['ADU']:.4f}. Asignadas {assigned} de {target}."
+            ),
+        }
+        for source in config.origin_warehouses:
+            info = origin_info[source]
+            report_row.update(
+                {
+                    f"STOCK_BASE_{source}": info["base"],
+                    f"NO_DISPONIBLE_{source}": info["unavailable"],
+                    f"COPERNICO_NO_USABLE_{source}": info[
+                        "copernico_unusable"
+                    ],
+                    f"RACKEADO_{source}": info["rackeado"],
+                    f"STOCK_INICIAL_AJUSTADO_{source}": info["adjusted"],
+                    f"STOCK_ANTES_{source}": origin_before[source],
+                    f"BLOQUEO_REGIONAL_{source}": regional_blocks[source],
+                    f"ASIGNADO_{source}": assigned_by_origin[source],
+                    f"STOCK_REMANENTE_{source}": stock_remaining[(source, sku)],
+                }
+            )
+        result.base_rows.append(report_row)
+        base_row_by_key[(destination, sku)] = report_row
+        next_order += 1
+        summary["cases_sent"] += 1
+        summary["cases_full"] += int(assigned >= target)
+        summary["cases_partial"] += int(assigned < target)
+        summary["tasks_added"] += len(allocations)
+        summary["units_added"] += assigned
+        summary["m3_added"] += assigned_m3
+        stores_sent.add(destination)
+        products_sent.add(sku)
+
+    result.capacity_rows.sort(key=lambda row: row["WAREHOUSE_DESTINATION"])
+    summary["m3_added"] = round(summary["m3_added"], 3)
+    summary["stores"] = len(stores_sent)
+    summary["products"] = len(products_sent)
+    summary["task_slots_after"] = max(config.max_tasks - result.tasks_used, 0)
+    return summary
+
+
+def write_executive_pdf(
+    path: Path,
+    *,
+    run_date: date,
+    origins: tuple[int, ...],
+    analytics: dict[str, Any],
+    status_counts: dict[str, int] | Counter[str],
+    input_requirements: int,
+    evaluated_requirements: int,
+    tasks: int,
+    max_tasks: int,
+    units: int,
+    city_block: dict[str, Any],
+    closed_stores: dict[str, Any],
+    insumos: dict[str, Any],
+    avl: dict[str, Any],
+) -> None:
+    """Genera un reporte PDF ejecutivo, legible y listo para compartir."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    page_width, page_height = landscape(A4)
+    black = pdf_colors.HexColor("#111111")
+    paper = pdf_colors.HexColor("#F6F2E8")
+    acid = pdf_colors.HexColor("#CFFF2E")
+    coral = pdf_colors.HexColor("#FF5B4D")
+    blue = pdf_colors.HexColor("#5577FF")
+    pale_green = pdf_colors.HexColor("#E6F7DF")
+    pale_blue = pdf_colors.HexColor("#E9EEFF")
+    grid = pdf_colors.HexColor("#D8D3C9")
+    grey = pdf_colors.HexColor("#5A5A5A")
+
+    base_styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "PdfTitle",
+        parent=base_styles["Title"],
+        fontName="Helvetica-Bold",
+        fontSize=25,
+        leading=27,
+        textColor=black,
+        alignment=TA_LEFT,
+        spaceAfter=3 * mm,
+    )
+    subtitle_style = ParagraphStyle(
+        "PdfSubtitle",
+        parent=base_styles["Normal"],
+        fontName="Helvetica",
+        fontSize=8.5,
+        leading=11,
+        textColor=grey,
+    )
+    section_style = ParagraphStyle(
+        "PdfSection",
+        parent=base_styles["Heading2"],
+        fontName="Helvetica-Bold",
+        fontSize=12,
+        leading=14,
+        textColor=paper,
+        backColor=black,
+        borderPadding=(4, 7, 4, 7),
+        spaceBefore=4 * mm,
+        spaceAfter=2.5 * mm,
+    )
+    body_style = ParagraphStyle(
+        "PdfBody",
+        parent=base_styles["BodyText"],
+        fontName="Helvetica",
+        fontSize=8,
+        leading=10.5,
+        textColor=black,
+    )
+    small_style = ParagraphStyle(
+        "PdfSmall",
+        parent=body_style,
+        fontSize=6.8,
+        leading=8.4,
+    )
+    table_header_style = ParagraphStyle(
+        "PdfTableHeader",
+        parent=small_style,
+        fontName="Helvetica-Bold",
+        textColor=paper,
+        alignment=TA_LEFT,
+    )
+    table_cell_style = ParagraphStyle(
+        "PdfTableCell",
+        parent=small_style,
+        textColor=black,
+    )
+    card_label_style = ParagraphStyle(
+        "PdfCardLabel",
+        parent=small_style,
+        fontName="Helvetica-Bold",
+        fontSize=6.6,
+        leading=8,
+        textColor=black,
+        alignment=TA_LEFT,
+    )
+    card_value_style = ParagraphStyle(
+        "PdfCardValue",
+        parent=body_style,
+        fontName="Helvetica-Bold",
+        fontSize=16,
+        leading=18,
+        textColor=black,
+        alignment=TA_LEFT,
+    )
+
+    def para(value: Any, style=table_cell_style) -> Paragraph:
+        return Paragraph(html.escape(str(value)), style)
+
+    def fmt_int(value: Any) -> str:
+        return f"{int(value or 0):,}"
+
+    def fmt_pct(value: Any) -> str:
+        return f"{float(value or 0):,.1f}%"
+
+    def fmt_m3(value: Any) -> str:
+        return f"{float(value or 0):,.3f}"
+
+    def report_table_pdf(
+        rows: list[dict[str, Any]],
+        columns: list[tuple[str, str, Any]],
+        widths: list[float],
+        *,
+        max_rows: int | None = None,
+    ) -> Table:
+        selected = rows if max_rows is None else rows[:max_rows]
+        data: list[list[Any]] = [
+            [para(label, table_header_style) for _, label, _ in columns]
+        ]
+        for row in selected:
+            data.append(
+                [
+                    para(formatter(row.get(key, "")), table_cell_style)
+                    for key, _, formatter in columns
+                ]
+            )
+        if not selected:
+            data.append(
+                [para("Sin registros", table_cell_style)]
+                + [para("", table_cell_style) for _ in columns[1:]]
+            )
+        table = Table(data, colWidths=widths, repeatRows=1, hAlign="LEFT")
+        table.setStyle(
+            TableStyle(
+                [
+                    ("BACKGROUND", (0, 0), (-1, 0), black),
+                    ("TEXTCOLOR", (0, 0), (-1, 0), paper),
+                    ("GRID", (0, 0), (-1, -1), 0.35, grid),
+                    ("BACKGROUND", (0, 1), (-1, -1), pdf_colors.white),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                    ("LEFTPADDING", (0, 0), (-1, -1), 4),
+                    ("RIGHTPADDING", (0, 0), (-1, -1), 4),
+                    ("TOPPADDING", (0, 0), (-1, -1), 3.5),
+                    ("BOTTOMPADDING", (0, 0), (-1, -1), 3.5),
+                ]
+            )
+        )
+        return table
+
+    def kpi_cards(cards: list[tuple[str, str, Any]]) -> Table:
+        cells = [
+            [
+                para(label.upper(), card_label_style),
+                Spacer(1, 1.2 * mm),
+                para(value, card_value_style),
+            ]
+            for label, value, _ in cards
+        ]
+        table = Table(
+            [cells],
+            colWidths=[(page_width - 28 * mm) / len(cells)] * len(cells),
+        )
+        style_commands: list[tuple[Any, ...]] = [
+            ("BOX", (0, 0), (-1, -1), 1.2, black),
+            ("INNERGRID", (0, 0), (-1, -1), 1.2, black),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 6),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+            ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+        ]
+        for column, (_, _, background) in enumerate(cards):
+            style_commands.append(
+                ("BACKGROUND", (column, 0), (column, 0), background)
+            )
+        table.setStyle(TableStyle(style_commands))
+        return table
+
+    summary = analytics["summary"]
+    origin_text = " · ".join(
+        f"{source} {ORIGIN_WAREHOUSES.get(source, '')}".strip()
+        for source in origins
+    )
+    story: list[Any] = [
+        Paragraph("REPORTE EJECUTIVO DE PLANEACIÓN", title_style),
+        Paragraph(
+            f"Fecha: {run_date:%d-%m-%Y} &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"Orígenes: {html.escape(origin_text)}",
+            subtitle_style,
+        ),
+        Spacer(1, 4 * mm),
+        kpi_cards(
+            [
+                ("Tareas de producto", fmt_int(tasks), acid),
+                ("Unidades de producto", fmt_int(units), paper),
+                ("Compliance de casos", fmt_pct(summary["case_compliance_pct"]), blue),
+                ("Compliance de unidades", fmt_pct(summary["unit_compliance_pct"]), coral),
+            ]
+        ),
+        Spacer(1, 3 * mm),
+        kpi_cards(
+            [
+                ("Tiendas atendidas", fmt_int(summary["stores_served"]), paper),
+                ("Productos distintos", fmt_int(summary["products_served"]), pale_blue),
+                ("Volumen asignado m3", fmt_m3(summary["m3_assigned"]), pale_green),
+                ("Uso del límite de tareas", f"{tasks:,} / {max_tasks:,}", paper),
+            ]
+        ),
+        Paragraph("LECTURA EJECUTIVA", section_style),
+    ]
+
+    executive_rows = [
+        [
+            para("Demanda Fountain9", table_header_style),
+            para("Stockouts", table_header_style),
+            para("Cobertura AVL", table_header_style),
+            para("Exclusiones y extras", table_header_style),
+        ],
+        [
+            para(
+                f"{input_requirements:,} casos únicos recibidos; "
+                f"{evaluated_requirements:,} evaluados. "
+                f"{summary['fully_covered_cases']:,} quedaron completos y "
+                f"{summary['partial_cases']:,} parciales.",
+                body_style,
+            ),
+            para(
+                f"{summary['stockout_cases_served']:,} de "
+                f"{summary['stockout_cases']:,} casos de stockout recibieron envío; "
+                f"{summary['stockout_cases_full']:,} se cubrieron completamente.",
+                body_style,
+            ),
+            para(
+                (
+                    f"Activada a {avl['doh']:g} DOH: "
+                    f"{avl['cases_sent']:,} casos, {avl['tasks_added']:,} tareas y "
+                    f"{avl['units_added']:,} unidades adicionales."
+                )
+                if avl.get("enabled")
+                else "Cobertura AVL desactivada en esta ejecución.",
+                body_style,
+            ),
+            para(
+                f"{closed_stores.get('requirements', 0):,} casos por tienda cerrada; "
+                f"{city_block.get('requirements', 0):,} por ciudad bloqueada; "
+                f"{insumos.get('lines_added', 0):,} líneas y "
+                f"{insumos.get('units_added', 0):,} unidades de insumos.",
+                body_style,
+            ),
+        ],
+    ]
+    executive_table = Table(
+        executive_rows,
+        colWidths=[(page_width - 28 * mm) / 4] * 4,
+    )
+    executive_table.setStyle(
+        TableStyle(
+            [
+                ("BACKGROUND", (0, 0), (-1, 0), black),
+                ("BACKGROUND", (0, 1), (-1, 1), pdf_colors.white),
+                ("GRID", (0, 0), (-1, -1), 0.6, black),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("LEFTPADDING", (0, 0), (-1, -1), 6),
+                ("RIGHTPADDING", (0, 0), (-1, -1), 6),
+                ("TOPPADDING", (0, 0), (-1, -1), 6),
+                ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
+            ]
+        )
+    )
+    story.extend(
+        [
+            executive_table,
+            Paragraph("BREAKDOWN DE LA PLANEACIÓN", section_style),
+            report_table_pdf(
+                ordered_breakdown_rows(status_counts),
+                [
+                    ("BREAKDOWN", "BREAKDOWN", str),
+                    ("FILAS", "CASOS / LÍNEAS", fmt_int),
+                ],
+                [220 * mm, 45 * mm],
+            ),
+            PageBreak(),
+            Paragraph("ANÁLISIS GENERAL", title_style),
+            Paragraph("RESULTADO POR CIUDAD", section_style),
+            report_table_pdf(
+                analytics["city_rows"],
+                [
+                    ("CIUDAD", "CIUDAD", str),
+                    ("TIENDAS_ATENDIDAS", "TIENDAS", fmt_int),
+                    ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                    ("TAREAS", "TAREAS", fmt_int),
+                    ("UNIDADES", "UNIDADES", fmt_int),
+                    ("M3", "M3", fmt_m3),
+                ],
+                [80 * mm, 34 * mm, 38 * mm, 30 * mm, 37 * mm, 35 * mm],
+            ),
+            Paragraph("RESULTADO POR ORIGEN", section_style),
+            report_table_pdf(
+                analytics["source_rows"],
+                [
+                    ("WAREHOUSE_SOURCE", "ORIGEN", str),
+                    ("NOMBRE", "NOMBRE", str),
+                    ("TAREAS", "TAREAS", fmt_int),
+                    ("UNIDADES", "UNIDADES", fmt_int),
+                    ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                    ("TIENDAS_ATENDIDAS", "TIENDAS", fmt_int),
+                    ("M3", "M3", fmt_m3),
+                ],
+                [25 * mm, 62 * mm, 28 * mm, 34 * mm, 33 * mm, 30 * mm, 32 * mm],
+            ),
+            Paragraph("TOP 15 TIENDAS POR UNIDADES", section_style),
+            report_table_pdf(
+                sorted(
+                    analytics["store_rows"],
+                    key=lambda row: (-row["UNIDADES"], row["WAREHOUSE_ID"]),
+                ),
+                [
+                    ("CIUDAD", "CIUDAD", str),
+                    ("WAREHOUSE_ID", "WH", str),
+                    ("TIENDA", "TIENDA", str),
+                    ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                    ("TAREAS", "TAREAS", fmt_int),
+                    ("UNIDADES", "UNIDADES", fmt_int),
+                    ("M3", "M3", fmt_m3),
+                ],
+                [48 * mm, 22 * mm, 75 * mm, 32 * mm, 26 * mm, 30 * mm, 28 * mm],
+                max_rows=15,
+            ),
+        ]
+    )
+
+    for detail in analytics.get("source_details", []):
+        source = detail["warehouse_source"]
+        source_summary = detail["summary"]
+        story.extend(
+            [
+                PageBreak(),
+                Paragraph(
+                    f"ANÁLISIS DEL ORIGEN {source}",
+                    title_style,
+                ),
+                Paragraph(html.escape(detail["name"]), subtitle_style),
+                Spacer(1, 3 * mm),
+                kpi_cards(
+                    [
+                        ("Tareas", fmt_int(source_summary["TAREAS"]), acid),
+                        ("Unidades", fmt_int(source_summary["UNIDADES"]), paper),
+                        ("Tiendas", fmt_int(source_summary["TIENDAS_ATENDIDAS"]), blue),
+                        ("Volumen m3", fmt_m3(source_summary["M3"]), coral),
+                    ]
+                ),
+                Paragraph("DISTRIBUCIÓN POR CIUDAD", section_style),
+                report_table_pdf(
+                    detail["city_rows"],
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("TIENDAS_ATENDIDAS", "TIENDAS", fmt_int),
+                        ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                        ("TAREAS", "TAREAS", fmt_int),
+                        ("UNIDADES", "UNIDADES", fmt_int),
+                        ("M3", "M3", fmt_m3),
+                    ],
+                    [76 * mm, 36 * mm, 40 * mm, 32 * mm, 38 * mm, 35 * mm],
+                ),
+                Paragraph("DISTRIBUCIÓN POR STORAGE", section_style),
+                report_table_pdf(
+                    detail["storage_rows"],
+                    [
+                        ("STORAGE", "STORAGE", str),
+                        ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                        ("TIENDAS_ATENDIDAS", "TIENDAS", fmt_int),
+                        ("TAREAS", "TAREAS", fmt_int),
+                        ("UNIDADES", "UNIDADES", fmt_int),
+                        ("M3", "M3", fmt_m3),
+                    ],
+                    [82 * mm, 40 * mm, 38 * mm, 32 * mm, 38 * mm, 34 * mm],
+                ),
+                Paragraph("TOP 12 TIENDAS DEL ORIGEN", section_style),
+                report_table_pdf(
+                    detail["store_rows"],
+                    [
+                        ("CIUDAD", "CIUDAD", str),
+                        ("WAREHOUSE_ID", "WH", str),
+                        ("TIENDA", "TIENDA", str),
+                        ("PRODUCTOS_DISTINTOS", "PRODUCTOS", fmt_int),
+                        ("TAREAS", "TAREAS", fmt_int),
+                        ("UNIDADES", "UNIDADES", fmt_int),
+                        ("M3", "M3", fmt_m3),
+                    ],
+                    [45 * mm, 22 * mm, 78 * mm, 34 * mm, 28 * mm, 30 * mm, 28 * mm],
+                    max_rows=12,
+                ),
+            ]
+        )
+
+    def decorate_page(canvas, document) -> None:
+        canvas.saveState()
+        canvas.setFillColor(paper)
+        canvas.rect(0, 0, page_width, page_height, fill=1, stroke=0)
+        canvas.setFillColor(black)
+        canvas.rect(0, page_height - 7 * mm, page_width, 7 * mm, fill=1, stroke=0)
+        canvas.setFont("Helvetica-Bold", 7)
+        canvas.setFillColor(paper)
+        canvas.drawString(13 * mm, page_height - 4.7 * mm, "SUPPLY · TRANSFER PLANNER")
+        canvas.setFont("Helvetica", 6.5)
+        canvas.setFillColor(grey)
+        canvas.drawString(13 * mm, 6 * mm, f"Planeación {run_date:%d-%m-%Y}")
+        canvas.drawRightString(
+            page_width - 13 * mm,
+            6 * mm,
+            f"Página {document.page}",
+        )
+        canvas.restoreState()
+
+    document = SimpleDocTemplate(
+        str(path),
+        pagesize=landscape(A4),
+        rightMargin=13 * mm,
+        leftMargin=13 * mm,
+        topMargin=13 * mm,
+        bottomMargin=11 * mm,
+        title=f"Reporte Ejecutivo de Planeación {run_date:%d-%m-%Y}",
+        author="Transfer Planner",
+        subject="Planeación ejecutiva de abasto y transferencias",
+    )
+    document.build(story, onFirstPage=decorate_page, onLaterPages=decorate_page)
+
+
 def execute_planning(
     uploaded_plan,
     database_bytes: bytes,
@@ -1767,6 +2693,8 @@ def execute_planning(
     run_date,
     blocked_cities: tuple[str, ...] = (),
     include_insumos: bool = True,
+    include_avl_fill: bool = False,
+    avl_doh: float = 3.0,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -1842,6 +2770,27 @@ def execute_planning(
                 f"{len(blocked_plan_rows):,} requerimientos antes de asignar stock."
             )
 
+        avl_summary = empty_avl_summary(include_avl_fill, avl_doh)
+        if include_avl_fill:
+            avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
+            result.warnings.extend(avl_warnings)
+            avl_summary = apply_avl_fill(
+                result,
+                avl_catalog_rows,
+                catalogs,
+                config,
+                closed_store_ids,
+                blocked_cities,
+                avl_doh,
+            )
+            result.warnings.append(
+                f"Cobertura AVL ({avl_doh:g} DOH): se agregaron "
+                f"{avl_summary['cases_sent']:,} casos, "
+                f"{avl_summary['tasks_added']:,} tareas y "
+                f"{avl_summary['units_added']:,} unidades usando exclusivamente "
+                "tareas remanentes."
+            )
+
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
         output_dir = (
@@ -1864,6 +2813,43 @@ def execute_planning(
             origins,
             include_insumos,
         )
+
+        status_counts = Counter(
+            row["TIPO_DE_CORTE"] for row in result.base_rows
+        )
+        if closed_summary["requirements"]:
+            status_counts["CORTE POR TIENDA CERRADA"] += closed_summary[
+                "requirements"
+            ]
+        if block_summary["requirements"]:
+            status_counts["CORTE POR CIUDAD BLOQUEADA"] += block_summary[
+                "requirements"
+            ]
+        if insumos_summary["lines_added"]:
+            status_counts["INSUMOS"] += insumos_summary["lines_added"]
+
+        units = sum(row["QUANTITY"] for row in result.allocation_rows)
+        requirements = len(result.base_rows)
+        pdf_path = output_dir / (
+            f"Reporte_Ejecutivo_Planeacion_{run_date:%d-%m-%Y}.pdf"
+        )
+        write_executive_pdf(
+            pdf_path,
+            run_date=run_date,
+            origins=origins,
+            analytics=analytics,
+            status_counts=status_counts,
+            input_requirements=len(plan_read.rows),
+            evaluated_requirements=requirements,
+            tasks=result.tasks_used,
+            max_tasks=config.max_tasks,
+            units=units,
+            city_block=block_summary,
+            closed_stores=closed_summary,
+            insumos=insumos_summary,
+            avl=avl_summary,
+        )
+        local_files.append(pdf_path)
         print(f"Requerimientos únicos del input: {len(plan_read.rows):,}")
         print(f"Requerimientos activos: {len(active_plan_rows):,}")
         print(
@@ -1872,6 +2858,12 @@ def execute_planning(
         )
         print(f"Requerimientos excluidos por ciudad: {len(blocked_plan_rows):,}")
         print(f"Tareas generadas: {result.tasks_used:,}")
+        if avl_summary["enabled"]:
+            print(
+                f"Cobertura AVL: {avl_summary['cases_sent']:,} casos / "
+                f"{avl_summary['tasks_added']:,} tareas / "
+                f"{avl_summary['units_added']:,} unidades"
+            )
         if insumos_summary["enabled"]:
             print(
                 "Insumos agregados a BulkCD_444: "
@@ -1884,17 +2876,6 @@ def execute_planning(
         local_files,
         workspace / f"Planeacion_{run_date:%d-%m-%Y}.zip",
     )
-    status_counts = Counter(row["TIPO_DE_CORTE"] for row in result.base_rows)
-    if closed_summary["requirements"]:
-        status_counts["TIENDA CERRADA - BLOQUEO BACKEND"] += closed_summary[
-            "requirements"
-        ]
-    if block_summary["requirements"]:
-        status_counts["CIUDAD BLOQUEADA MANUALMENTE"] += block_summary[
-            "requirements"
-        ]
-    units = sum(row["QUANTITY"] for row in result.allocation_rows)
-    requirements = len(result.base_rows)
     return {
         "workspace": str(workspace),
         "files": [str(path) for path in local_files],
@@ -1911,6 +2892,7 @@ def execute_planning(
         "city_block": block_summary,
         "closed_stores": closed_summary,
         "insumos": insumos_summary,
+        "avl": avl_summary,
     }
 
 
@@ -2522,6 +3504,57 @@ def render_results(run: dict[str, Any]) -> None:
         columns_count=3,
     )
 
+    avl = run.get("avl", {})
+    if avl.get("enabled"):
+        st.markdown(
+            '<span class="section-label">COBERTURA AVL · ÚLTIMA PASADA</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · AVL",
+                    "label": "STOCKOUTS CON ENVÍO AVL",
+                    "value": f"{avl.get('cases_sent', 0):,}",
+                    "description": (
+                        "Combinaciones tienda–SKU del CATALOGO con stock final "
+                        "igual a cero que recibieron producto después de terminar "
+                        "la recomendación Fountain9."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · AVL",
+                    "label": "TAREAS SOBRANTES UTILIZADAS",
+                    "value": f"{avl.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales utilizadas por AVL. Solo "
+                        "consume el remanente entre el máximo configurado y las "
+                        "tareas que ya ocupó Fountain9."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · AVL",
+                    "label": "UNIDADES ADICIONALES AVL",
+                    "value": f"{avl.get('units_added', 0):,}",
+                    "description": (
+                        f"Unidades enviadas para cubrir {avl.get('doh', 0):g} DOH "
+                        "según ADU. El objetivo mínimo es 3, salvo que el stock "
+                        "permitido disponible sea menor."
+                    ),
+                    "tone": "coral",
+                },
+            ],
+            columns_count=3,
+        )
+        st.success(
+            f"Cobertura AVL a {avl.get('doh', 0):g} DOH: "
+            f"{avl.get('cases_sent', 0):,} casos, "
+            f"{avl.get('tasks_added', 0):,} tareas y "
+            f"{avl.get('units_added', 0):,} unidades adicionales."
+        )
+
     insumos = run.get("insumos", {})
     if insumos.get("lines_added", 0) > 0:
         st.success(
@@ -2568,6 +3601,8 @@ def render_results(run: dict[str, Any]) -> None:
         mime = (
             "text/csv"
             if path.suffix.lower() == ".csv"
+            else "application/pdf"
+            if path.suffix.lower() == ".pdf"
             else "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
         with columns[index % len(columns)]:
@@ -2582,10 +3617,7 @@ def render_results(run: dict[str, Any]) -> None:
             )
 
     st.markdown('<span class="section-label">BREAKDOWN</span>', unsafe_allow_html=True)
-    breakdown = [
-        {"TIPO_DE_CORTE": status, "FILAS": count}
-        for status, count in sorted(run["status_counts"].items())
-    ]
+    breakdown = ordered_breakdown_rows(run["status_counts"])
     st.dataframe(breakdown, use_container_width=True, hide_index=True)
 
     if run.get("analytics"):
@@ -2707,6 +3739,33 @@ def main() -> None:
             ),
         )
 
+        avl_left, avl_right = st.columns([2, 1])
+        with avl_left:
+            include_avl_fill = st.toggle(
+                "Completar tareas disponibles con cobertura AVL",
+                value=False,
+                help=(
+                    "Después de cubrir Fountain9, busca productos del catálogo con stock "
+                    "final igual a cero en la tienda y utiliza únicamente las "
+                    "tareas sobrantes. Mantiene capacidad, rutas, bloqueos, "
+                    "rackeados y prioridad de orígenes."
+                ),
+            )
+        with avl_right:
+            avl_doh = st.number_input(
+                "DOH para cobertura AVL",
+                min_value=0.5,
+                max_value=30.0,
+                value=3.0,
+                step=0.5,
+                disabled=not include_avl_fill,
+                help=(
+                    "Cantidad objetivo = ADU × DOH, redondeada hacia arriba. "
+                    "Se envían al menos 3 unidades; si el stock permitido no "
+                    "alcanza, se manda lo disponible."
+                ),
+            )
+
         submitted = st.form_submit_button(
             "EJECUTAR PLANEACIÓN →", use_container_width=True
         )
@@ -2747,6 +3806,11 @@ def main() -> None:
                 else:
                     st.write("Envío de insumos desactivado para esta corrida.")
                 st.write("Calculando demanda, stock, capacidad y tareas…")
+                if include_avl_fill:
+                    st.write(
+                        f"Reservando la última pasada para cobertura AVL a "
+                        f"{avl_doh:g} DOH…"
+                    )
                 run = execute_planning(
                     uploaded_plan=uploaded_plan,
                     database_bytes=database_bytes,
@@ -2755,6 +3819,8 @@ def main() -> None:
                     run_date=run_date,
                     blocked_cities=tuple(selected_blocked_cities),
                     include_insumos=include_insumos,
+                    include_avl_fill=include_avl_fill,
+                    avl_doh=float(avl_doh),
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run
