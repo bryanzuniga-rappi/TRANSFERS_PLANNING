@@ -2,11 +2,13 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import redirect_stdout
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
+import html
 import io
+import re
 import shutil
 import tempfile
 import urllib.error
@@ -56,6 +58,34 @@ REQUIRED_DATABASE_SHEETS = (
     "TIENDA",
     "STORAGE",
 )
+
+ENGLISH_MONTHS = {
+    "JANUARY": 1,
+    "FEBRUARY": 2,
+    "MARCH": 3,
+    "APRIL": 4,
+    "MAY": 5,
+    "JUNE": 6,
+    "JULY": 7,
+    "AUGUST": 8,
+    "SEPTEMBER": 9,
+    "OCTOBER": 10,
+    "NOVEMBER": 11,
+    "DECEMBER": 12,
+}
+
+TIMEZONE_OFFSETS = {
+    "UTC": 0,
+    "GMT": 0,
+    "EDT": -4,
+    "EST": -5,
+    "CDT": -5,
+    "CST": -6,
+    "MDT": -6,
+    "MST": -7,
+    "PDT": -7,
+    "PST": -8,
+}
 
 
 st.set_page_config(
@@ -173,10 +203,6 @@ def inject_styles() -> None:
             box-shadow: 8px 8px 0 var(--ink);
             padding: 20px 22px;
             margin: 8px 9px 22px 0;
-            display: flex;
-            align-items: center;
-            justify-content: space-between;
-            gap: 18px;
         }
 
         .database-status.online { background: var(--acid); }
@@ -188,12 +214,47 @@ def inject_styles() -> None:
             line-height: 1;
         }
 
-        .database-detail {
+        .source-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
+            gap: 18px;
+            margin: 0 9px 26px 0;
+        }
+
+        .source-card {
+            min-height: 132px;
             border: 3px solid var(--ink);
-            background: var(--white);
-            padding: 7px 11px;
+            box-shadow: 6px 6px 0 var(--ink);
+            padding: 16px 17px;
+            display: flex;
+            flex-direction: column;
+            justify-content: space-between;
+        }
+
+        .source-card.ok { background: #baf264; }
+        .source-card.error { background: var(--coral); }
+
+        .source-card-name {
+            font-family: "Archivo Black", sans-serif;
+            font-size: 1.05rem;
+            line-height: 1.05;
+            overflow-wrap: anywhere;
+        }
+
+        .source-card-meta {
+            margin-top: 9px;
+            color: #242424;
+            font-size: .76rem;
+            font-weight: 800;
+        }
+
+        .source-card-result {
+            margin-top: 13px;
+            border-top: 2px solid var(--ink);
+            padding-top: 9px;
+            font-size: .86rem;
             font-weight: 900;
-            white-space: nowrap;
+            text-transform: uppercase;
         }
 
         div[data-testid="stFileUploader"] {
@@ -296,18 +357,108 @@ def format_origin(warehouse_id: int) -> str:
     return f"{warehouse_id} - {ORIGIN_WAREHOUSES[warehouse_id]}"
 
 
-def display_cell_value(value: Any) -> str:
-    if value is None or str(value).strip() == "":
-        return "SIN DATO"
-    if isinstance(value, datetime):
-        return value.strftime("%d-%m-%Y %H:%M:%S")
-    if isinstance(value, date):
-        return value.strftime("%d-%m-%Y")
-    return str(value).strip()
-
-
 def contains_ref_error(value: Any) -> bool:
     return value is not None and "#REF!" in str(value).upper()
+
+
+def parse_update_timestamp(value: Any) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+    else:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+
+        english = re.fullmatch(
+            r"([A-Za-z]+)\s+(\d{1,2}),\s*(\d{4}),?\s*"
+            r"(\d{1,2}):(\d{2})(?::(\d{2}))?\s*"
+            r"(AM|PM)?(?:\s+([A-Za-z]{2,5}))?",
+            raw,
+            flags=re.IGNORECASE,
+        )
+        if english:
+            month_name, day, year, hour, minute, second, meridiem, zone = english.groups()
+            month = ENGLISH_MONTHS.get(month_name.upper())
+            if month is None:
+                return None
+            hour_number = int(hour)
+            if meridiem and hour_number <= 12:
+                if meridiem.upper() == "PM" and hour_number < 12:
+                    hour_number += 12
+                elif meridiem.upper() == "AM" and hour_number == 12:
+                    hour_number = 0
+            if hour_number > 23:
+                return None
+            zone_name = (zone or "").upper()
+            tzinfo = (
+                timezone(timedelta(hours=TIMEZONE_OFFSETS[zone_name]))
+                if zone_name in TIMEZONE_OFFSETS
+                else ZoneInfo("America/Mexico_City")
+            )
+            try:
+                return datetime(
+                    int(year),
+                    month,
+                    int(day),
+                    hour_number,
+                    int(minute),
+                    int(second or 0),
+                    tzinfo=tzinfo,
+                )
+            except ValueError:
+                return None
+
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            parsed = None
+            for date_format in (
+                "%d/%m/%Y %H:%M:%S",
+                "%m/%d/%Y %H:%M:%S",
+                "%d-%m-%Y %H:%M:%S",
+                "%Y-%m-%d %H:%M:%S",
+            ):
+                try:
+                    parsed = datetime.strptime(raw, date_format)
+                    break
+                except ValueError:
+                    continue
+            if parsed is None:
+                return None
+
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=ZoneInfo("America/Mexico_City"))
+    return parsed
+
+
+def relative_update_text(
+    value: Any,
+    now: datetime | None = None,
+) -> tuple[str, bool]:
+    parsed = parse_update_timestamp(value)
+    if parsed is None:
+        return "C7 SIN FECHA VÁLIDA", False
+
+    reference = now or datetime.now(ZoneInfo("America/Mexico_City"))
+    if reference.tzinfo is None:
+        reference = reference.replace(tzinfo=ZoneInfo("America/Mexico_City"))
+    seconds = (reference.astimezone(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds()
+    if seconds < -300:
+        return "C7 TIENE FECHA FUTURA", False
+    seconds = max(seconds, 0)
+
+    if seconds < 60:
+        return "Hace menos de 1 min", True
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        return f"Hace {minutes} min", True
+    if seconds < 86400:
+        hours = int(seconds // 3600)
+        return f"Hace {hours} h", True
+    days = int(seconds // 86400)
+    return f"Hace {days} día" if days == 1 else f"Hace {days} días", True
 
 
 def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
@@ -327,7 +478,7 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                         "HOJA": sheet_name,
                         "TIPO": "ALEPH" if sheet_name in ALEPH_SHEETS else "IMPORTRANGE",
                         "CONTROL": "C7" if sheet_name in ALEPH_SHEETS else "A1",
-                        "ÚLTIMA ACTUALIZACIÓN / VALIDACIÓN": "HOJA NO ENCONTRADA",
+                        "DETALLE": "HOJA NO ENCONTRADA",
                         "ESTADO": "ERROR",
                     }
                 )
@@ -339,8 +490,10 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                 value = value_sheet["C7"].value
                 if value is None:
                     value = formula_sheet["C7"].value
-                healthy = value is not None and str(value).strip() != "" and not contains_ref_error(value)
-                detail = display_cell_value(value)
+                detail, healthy = relative_update_text(value)
+                if contains_ref_error(value):
+                    healthy = False
+                    detail = "#REF! DETECTADO EN C7"
             else:
                 formula_value = formula_sheet["A1"].value
                 displayed_value = value_sheet["A1"].value
@@ -355,7 +508,7 @@ def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
                     "HOJA": sheet_name,
                     "TIPO": "ALEPH" if sheet_name in ALEPH_SHEETS else "IMPORTRANGE",
                     "CONTROL": "C7" if sheet_name in ALEPH_SHEETS else "A1",
-                    "ÚLTIMA ACTUALIZACIÓN / VALIDACIÓN": detail,
+                    "DETALLE": detail,
                     "ESTADO": "OK" if healthy else "ERROR",
                 }
             )
@@ -420,38 +573,46 @@ def render_database_health(health: dict[str, Any]) -> None:
     online = health["online"]
     css_class = "online" if online else "review"
     status = "ONLINE" if online else "REVISAR"
-    detail = f"{health['healthy_count']} / {health['total_count']} HOJAS OK"
     st.markdown(
         f"""
         <div class="database-status {css_class}">
             <div class="database-title">BASE DE DATOS — {status}</div>
-            <div class="database-detail">{detail}</div>
         </div>
         """,
         unsafe_allow_html=True,
     )
-    with st.expander("Ver estado de las fuentes", expanded=not online):
-        st.dataframe(
-            health["rows"],
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "HOJA": st.column_config.TextColumn("HOJA", width="medium"),
-                "TIPO": st.column_config.TextColumn("TIPO", width="small"),
-                "CONTROL": st.column_config.TextColumn("CONTROL", width="small"),
-                "ÚLTIMA ACTUALIZACIÓN / VALIDACIÓN": st.column_config.TextColumn(
-                    "ÚLTIMA ACTUALIZACIÓN / VALIDACIÓN", width="large"
-                ),
-                "ESTADO": st.column_config.TextColumn("ESTADO", width="small"),
-            },
+
+    cards: list[str] = []
+    for row in health["rows"]:
+        card_class = "ok" if row["ESTADO"] == "OK" else "error"
+        card_meta = (
+            "ÚLTIMA ACTUALIZACIÓN"
+            if row["TIPO"] == "ALEPH"
+            else "CONEXIÓN IMPORTRANGE"
         )
-        if online:
-            st.success("Todas las fuentes requeridas respondieron correctamente.")
-        else:
-            st.error(
-                f"Se detectaron {health['error_count']} hojas con problemas. "
-                "Revísalas antes de ejecutar la planeación."
-            )
+        cards.append(
+            f"""
+            <article class="source-card {card_class}">
+                <div>
+                    <div class="source-card-name">{html.escape(row['HOJA'])}</div>
+                    <div class="source-card-meta">
+                        {card_meta}
+                    </div>
+                </div>
+                <div class="source-card-result">{html.escape(row['DETALLE'])}</div>
+            </article>
+            """
+        )
+    st.markdown(
+        '<div class="source-grid">' + "".join(cards) + "</div>",
+        unsafe_allow_html=True,
+    )
+
+    if not online:
+        st.error(
+            f"Se detectaron {health['error_count']} hojas con problemas. "
+            "Revísalas antes de ejecutar la planeación."
+        )
 
 
 def create_zip(paths: list[Path], destination: Path) -> Path:
@@ -611,7 +772,6 @@ def main() -> None:
             """
             <div class="database-status review">
                 <div class="database-title">BASE DE DATOS — OFFLINE</div>
-                <div class="database-detail">SIN CONEXIÓN</div>
             </div>
             """,
             unsafe_allow_html=True,
