@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections import Counter
+from collections import Counter, defaultdict
 from contextlib import redirect_stdout
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -110,6 +110,13 @@ SHEET_DESCRIPTIONS = {
         "Condición de almacenamiento de cada producto, como room temperature, "
         "refrigerated o freezer."
     ),
+}
+
+DEMAND_RULE_LABELS = {
+    "MOV_MINIMO_3": "MOV POSITIVO",
+    "HARDCODE_4_CERO_TOTAL": "FORECAST 0 · FORZADO A 4",
+    "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": "MOV 0 · INVENTARIO MENOR A DEMANDA",
+    "SIN_DEMANDA": "SIN DEMANDA DE REABASTO",
 }
 
 ENGLISH_MONTHS = {
@@ -413,6 +420,24 @@ def inject_styles() -> None:
             font-size: clamp(2rem, 5vw, 4.3rem);
             line-height: .95;
             margin: 38px 0 18px;
+        }
+
+        .report-title {
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(1.8rem, 4vw, 3.1rem);
+            line-height: .95;
+            margin: 52px 0 18px;
+        }
+
+        .report-note {
+            border: 3px solid var(--ink);
+            background: var(--blue);
+            color: var(--white);
+            box-shadow: 5px 5px 0 var(--ink);
+            padding: 12px 14px;
+            margin: 0 6px 22px 0;
+            font-size: .78rem;
+            font-weight: 800;
         }
 
         .file-pill {
@@ -720,6 +745,291 @@ def clear_previous_workspace() -> None:
         shutil.rmtree(resolved, ignore_errors=True)
 
 
+def percentage(numerator: float, denominator: float) -> float:
+    if denominator <= 0:
+        return 0.0
+    return round((numerator / denominator) * 100, 1)
+
+
+def build_planning_analytics(result) -> dict[str, Any]:
+    base_rows = result.base_rows
+    allocation_rows = result.allocation_rows
+    eligible_rows = [row for row in base_rows if row["CANTIDAD_OBJETIVO"] > 0]
+    assigned_rows = [row for row in eligible_rows if row["CANTIDAD_ASIGNADA"] > 0]
+    fully_covered_rows = [
+        row
+        for row in eligible_rows
+        if row["CANTIDAD_ASIGNADA"] >= row["CANTIDAD_OBJETIVO"]
+    ]
+    partially_covered_rows = [
+        row
+        for row in eligible_rows
+        if 0 < row["CANTIDAD_ASIGNADA"] < row["CANTIDAD_OBJETIVO"]
+    ]
+    not_assigned_rows = [
+        row for row in eligible_rows if row["CANTIDAD_ASIGNADA"] <= 0
+    ]
+
+    city_accumulators: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "stores": set(),
+            "products": set(),
+            "units": 0,
+            "tasks": 0,
+            "m3": 0.0,
+        }
+    )
+    store_accumulators: dict[tuple[str, int, str], dict[str, Any]] = defaultdict(
+        lambda: {"products": set(), "units": 0, "tasks": 0, "m3": 0.0}
+    )
+
+    for row in assigned_rows:
+        city = row.get("CITY") or "SIN CIUDAD"
+        destination = row["WAREHOUSE_DESTINATION"]
+        warehouse_name = row.get("WAREHOUSE_NAME") or "SIN NOMBRE"
+        sku = row["RETAIL_ID"]
+        units = int(row["CANTIDAD_ASIGNADA"])
+        tasks = int(row["TAREAS_GENERADAS"])
+        assigned_m3 = float(row["M3_ASIGNADO"])
+
+        city_data = city_accumulators[city]
+        city_data["stores"].add(destination)
+        city_data["products"].add(sku)
+        city_data["units"] += units
+        city_data["tasks"] += tasks
+        city_data["m3"] += assigned_m3
+
+        store_data = store_accumulators[(city, destination, warehouse_name)]
+        store_data["products"].add(sku)
+        store_data["units"] += units
+        store_data["tasks"] += tasks
+        store_data["m3"] += assigned_m3
+
+    city_rows = [
+        {
+            "CIUDAD": city,
+            "TIENDAS_ATENDIDAS": len(data["stores"]),
+            "PRODUCTOS_DISTINTOS": len(data["products"]),
+            "UNIDADES": data["units"],
+            "M3": round(data["m3"], 3),
+            "TAREAS": data["tasks"],
+        }
+        for city, data in sorted(city_accumulators.items())
+    ]
+    store_rows = [
+        {
+            "CIUDAD": city,
+            "WAREHOUSE_ID": destination,
+            "TIENDA": warehouse_name,
+            "PRODUCTOS_DISTINTOS": len(data["products"]),
+            "UNIDADES": data["units"],
+            "M3": round(data["m3"], 3),
+            "TAREAS": data["tasks"],
+        }
+        for (city, destination, warehouse_name), data in store_accumulators.items()
+    ]
+    store_rows.sort(key=lambda row: (row["CIUDAD"], -row["UNIDADES"], row["WAREHOUSE_ID"]))
+
+    stockout_rows = [
+        row for row in eligible_rows if bool(row.get("ES_STOCKOUT", False))
+    ]
+    stockout_served = [row for row in stockout_rows if row["CANTIDAD_ASIGNADA"] > 0]
+    stockout_fully_covered = [
+        row
+        for row in stockout_rows
+        if row["CANTIDAD_ASIGNADA"] >= row["CANTIDAD_OBJETIVO"]
+    ]
+    forecast_zero_forced = [
+        row
+        for row in eligible_rows
+        if row["REGLA_DEMANDA"] == "HARDCODE_4_CERO_TOTAL"
+    ]
+    forecast_zero_served = [
+        row for row in forecast_zero_forced if row["CANTIDAD_ASIGNADA"] > 0
+    ]
+    deficit_forced = [
+        row
+        for row in eligible_rows
+        if row["REGLA_DEMANDA"] == "HARDCODE_3_INVENTARIO_MENOR_DEMANDA"
+    ]
+    minimum_three_applied = [
+        row
+        for row in eligible_rows
+        if 0 < row["MOV_ORIGINAL"] < 3 and row["CANTIDAD_OBJETIVO"] == 3
+    ]
+    golden_rows = [
+        row for row in eligible_rows if bool(row.get("ES_GOLDEN_INFALTABLE", False))
+    ]
+
+    rule_accumulators: dict[str, dict[str, float]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "served": 0,
+            "full": 0,
+            "target_units": 0,
+            "assigned_units": 0,
+        }
+    )
+    for row in base_rows:
+        rule = row["REGLA_DEMANDA"]
+        data = rule_accumulators[rule]
+        target = int(row["CANTIDAD_OBJETIVO"])
+        assigned = int(row["CANTIDAD_ASIGNADA"])
+        data["cases"] += 1
+        data["served"] += int(assigned > 0)
+        data["full"] += int(target > 0 and assigned >= target)
+        data["target_units"] += target
+        data["assigned_units"] += assigned
+
+    rule_order = {rule: index for index, rule in enumerate(DEMAND_RULE_LABELS)}
+    rule_rows = []
+    for rule, data in sorted(
+        rule_accumulators.items(), key=lambda item: rule_order.get(item[0], 999)
+    ):
+        rule_rows.append(
+            {
+                "REGLA": DEMAND_RULE_LABELS.get(rule, rule),
+                "CASOS": int(data["cases"]),
+                "CASOS_CON_ENVIO": int(data["served"]),
+                "COBERTURA_COMPLETA": int(data["full"]),
+                "UNIDADES_OBJETIVO": int(data["target_units"]),
+                "UNIDADES_ASIGNADAS": int(data["assigned_units"]),
+                "FILL_RATE_%": percentage(
+                    data["assigned_units"], data["target_units"]
+                ),
+            }
+        )
+
+    stockout_city_accumulators: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "cases": 0,
+            "served": 0,
+            "full": 0,
+            "products": set(),
+            "units": 0,
+        }
+    )
+    for row in stockout_rows:
+        city = row.get("CITY") or "SIN CIUDAD"
+        data = stockout_city_accumulators[city]
+        assigned = int(row["CANTIDAD_ASIGNADA"])
+        data["cases"] += 1
+        if assigned > 0:
+            data["served"] += 1
+            data["products"].add(row["RETAIL_ID"])
+            data["units"] += assigned
+        if assigned >= row["CANTIDAD_OBJETIVO"]:
+            data["full"] += 1
+
+    stockout_city_rows = [
+        {
+            "CIUDAD": city,
+            "CASOS_STOCKOUT": data["cases"],
+            "CASOS_CON_ENVIO": data["served"],
+            "COBERTURA_COMPLETA": data["full"],
+            "PRODUCTOS_DISTINTOS_ATENDIDOS": len(data["products"]),
+            "UNIDADES_ASIGNADAS": data["units"],
+            "ATENCION_%": percentage(data["served"], data["cases"]),
+        }
+        for city, data in sorted(stockout_city_accumulators.items())
+    ]
+
+    m3_by_destination_sku = {
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["M3_POR_UNIDAD"]
+        for row in base_rows
+    }
+    source_accumulators: dict[int, dict[str, Any]] = defaultdict(
+        lambda: {
+            "tasks": 0,
+            "units": 0,
+            "products": set(),
+            "stores": set(),
+            "m3": 0.0,
+        }
+    )
+    for row in allocation_rows:
+        source = row["WAREHOUSE_SOURCE"]
+        data = source_accumulators[source]
+        quantity = int(row["QUANTITY"])
+        destination = row["WAREHOUSE_DESTINATION"]
+        sku = row["RETAIL_ID"]
+        data["tasks"] += 1
+        data["units"] += quantity
+        data["products"].add(sku)
+        data["stores"].add(destination)
+        data["m3"] += quantity * float(
+            m3_by_destination_sku.get((destination, sku), 0.0)
+        )
+
+    source_rows = [
+        {
+            "WAREHOUSE_SOURCE": source,
+            "NOMBRE": ORIGIN_WAREHOUSES.get(source, "ORIGEN CONFIGURADO"),
+            "TAREAS": data["tasks"],
+            "UNIDADES": data["units"],
+            "PRODUCTOS_DISTINTOS": len(data["products"]),
+            "TIENDAS_ATENDIDAS": len(data["stores"]),
+            "M3": round(data["m3"], 3),
+        }
+        for source, data in source_accumulators.items()
+    ]
+    source_rows.sort(key=lambda row: row["WAREHOUSE_SOURCE"])
+
+    target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in eligible_rows)
+    assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in eligible_rows)
+    return {
+        "city_rows": city_rows,
+        "store_rows": store_rows,
+        "rule_rows": rule_rows,
+        "stockout_city_rows": stockout_city_rows,
+        "source_rows": source_rows,
+        "summary": {
+            "eligible_cases": len(eligible_rows),
+            "fully_covered_cases": len(fully_covered_rows),
+            "partial_cases": len(partially_covered_rows),
+            "not_assigned_cases": len(not_assigned_rows),
+            "target_units": target_units,
+            "assigned_units": assigned_units,
+            "fill_rate_pct": percentage(assigned_units, target_units),
+            "m3_assigned": round(
+                sum(float(row["M3_ASIGNADO"]) for row in assigned_rows), 3
+            ),
+            "cities_served": len(city_rows),
+            "stores_served": len(store_rows),
+            "products_served": len({row["RETAIL_ID"] for row in assigned_rows}),
+            "stockout_cases": len(stockout_rows),
+            "stockout_cases_served": len(stockout_served),
+            "stockout_cases_full": len(stockout_fully_covered),
+            "stockout_products_served": len(
+                {row["RETAIL_ID"] for row in stockout_served}
+            ),
+            "stockout_stores_served": len(
+                {row["WAREHOUSE_DESTINATION"] for row in stockout_served}
+            ),
+            "stockout_attention_pct": percentage(
+                len(stockout_served), len(stockout_rows)
+            ),
+            "forecast_zero_forced_cases": len(forecast_zero_forced),
+            "forecast_zero_served_cases": len(forecast_zero_served),
+            "forecast_zero_target_units": sum(
+                int(row["CANTIDAD_OBJETIVO"]) for row in forecast_zero_forced
+            ),
+            "forecast_zero_assigned_units": sum(
+                int(row["CANTIDAD_ASIGNADA"]) for row in forecast_zero_forced
+            ),
+            "deficit_forced_cases": len(deficit_forced),
+            "deficit_forced_served_cases": sum(
+                row["CANTIDAD_ASIGNADA"] > 0 for row in deficit_forced
+            ),
+            "minimum_three_cases": len(minimum_three_applied),
+            "golden_cases": len(golden_rows),
+            "golden_served_cases": sum(
+                row["CANTIDAD_ASIGNADA"] > 0 for row in golden_rows
+            ),
+        },
+    }
+
+
 def execute_planning(
     uploaded_plan,
     database_bytes: bytes,
@@ -766,6 +1076,7 @@ def execute_planning(
     status_counts = dict(Counter(row["TIPO_DE_CORTE"] for row in result.base_rows))
     units = sum(row["QUANTITY"] for row in result.allocation_rows)
     requirements = len(result.base_rows)
+    analytics = build_planning_analytics(result)
     return {
         "workspace": str(workspace),
         "files": [str(path) for path in local_files],
@@ -777,7 +1088,159 @@ def execute_planning(
         "warnings": list(result.warnings),
         "logs": captured.getvalue(),
         "origins": list(origins),
+        "analytics": analytics,
     }
+
+
+def report_table(
+    rows: list[dict[str, Any]],
+    *,
+    column_config: dict[str, Any] | None = None,
+    max_height: int = 560,
+) -> None:
+    if not rows:
+        st.info("No existen registros para mostrar en esta sección.")
+        return
+    height = min(max(150, 36 * (len(rows) + 1)), max_height)
+    st.dataframe(
+        rows,
+        use_container_width=True,
+        hide_index=True,
+        height=height,
+        column_config=column_config or {},
+    )
+
+
+def render_planning_analytics(analytics: dict[str, Any]) -> None:
+    summary = analytics["summary"]
+
+    st.markdown(
+        '<div class="report-title">CIUDADES + TIENDAS.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            PRODUCTOS = SKUs distintos con al menos una unidad asignada · M³ = volumen
+            realmente planeado · TAREAS = líneas generadas considerando cada origen.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    city_kpi_1, city_kpi_2, city_kpi_3, city_kpi_4 = st.columns(4)
+    city_kpi_1.metric("CIUDADES ATENDIDAS", f"{summary['cities_served']:,}")
+    city_kpi_2.metric("TIENDAS ATENDIDAS", f"{summary['stores_served']:,}")
+    city_kpi_3.metric("PRODUCTOS DISTINTOS", f"{summary['products_served']:,}")
+    city_kpi_4.metric("M³ PLANEADOS", f"{summary['m3_assigned']:,.3f}")
+
+    st.markdown('<span class="section-label">RESUMEN POR CIUDAD</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["city_rows"],
+        column_config={
+            "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+        },
+        max_height=360,
+    )
+
+    st.markdown('<span class="section-label">DETALLE POR TIENDA</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["store_rows"],
+        column_config={
+            "WAREHOUSE_ID": st.column_config.NumberColumn(
+                "WAREHOUSE ID", format="%d"
+            ),
+            "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+        },
+        max_height=600,
+    )
+
+    st.markdown(
+        '<div class="report-title">REPORTE DE REABASTO.</div>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        """
+        <div class="report-note">
+            Un caso representa una combinación tienda–SKU. “Con envío” significa que se
+            asignó al menos una unidad; “cobertura completa” significa que se cubrió toda
+            la cantidad objetivo calculada por el modelo.
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    stockout_1, stockout_2, stockout_3, stockout_4 = st.columns(4)
+    stockout_1.metric(
+        "STOCKOUTS CON ENVÍO", f"{summary['stockout_cases_served']:,}"
+    )
+    stockout_2.metric(
+        "SKUs STOCKOUT ATENDIDOS", f"{summary['stockout_products_served']:,}"
+    )
+    stockout_3.metric(
+        "FORECAST 0 FORZADOS", f"{summary['forecast_zero_forced_cases']:,}"
+    )
+    stockout_4.metric(
+        "UNIDADES FORECAST 0",
+        f"{summary['forecast_zero_assigned_units']:,}",
+    )
+
+    coverage_1, coverage_2, coverage_3, coverage_4 = st.columns(4)
+    coverage_1.metric(
+        "COBERTURA COMPLETA", f"{summary['fully_covered_cases']:,}"
+    )
+    coverage_2.metric("COBERTURA PARCIAL", f"{summary['partial_cases']:,}")
+    coverage_3.metric("CASOS SIN ENVÍO", f"{summary['not_assigned_cases']:,}")
+    coverage_4.metric("FILL RATE UNIDADES", f"{summary['fill_rate_pct']:,.1f}%")
+
+    special_1, special_2, special_3, special_4 = st.columns(4)
+    special_1.metric(
+        "STOCKOUTS CUBIERTOS 100%", f"{summary['stockout_cases_full']:,}"
+    )
+    special_2.metric(
+        "INVENTARIO < DEMANDA · FORZADOS",
+        f"{summary['deficit_forced_cases']:,}",
+    )
+    special_3.metric(
+        "MÍNIMO DE 3 APLICADO", f"{summary['minimum_three_cases']:,}"
+    )
+    special_4.metric(
+        "GOLDEN CON ENVÍO", f"{summary['golden_served_cases']:,}"
+    )
+
+    st.markdown('<span class="section-label">REGLAS DE DEMANDA</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["rule_rows"],
+        column_config={
+            "FILL_RATE_%": st.column_config.NumberColumn(
+                "FILL RATE %", format="%.1f%%"
+            ),
+        },
+        max_height=360,
+    )
+
+    st.markdown('<span class="section-label">STOCKOUTS POR CIUDAD</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["stockout_city_rows"],
+        column_config={
+            "ATENCION_%": st.column_config.NumberColumn(
+                "ATENCIÓN %", format="%.1f%%"
+            ),
+        },
+        max_height=400,
+    )
+
+    st.markdown('<span class="section-label">ASIGNACIÓN POR ORIGEN</span>', unsafe_allow_html=True)
+    report_table(
+        analytics["source_rows"],
+        column_config={
+            "WAREHOUSE_SOURCE": st.column_config.NumberColumn(
+                "WAREHOUSE SOURCE", format="%d"
+            ),
+            "M3": st.column_config.NumberColumn("M³", format="%.3f"),
+        },
+        max_height=360,
+    )
 
 
 def render_results(run: dict[str, Any]) -> None:
@@ -823,6 +1286,9 @@ def render_results(run: dict[str, Any]) -> None:
         for status, count in sorted(run["status_counts"].items())
     ]
     st.dataframe(breakdown, use_container_width=True, hide_index=True)
+
+    if run.get("analytics"):
+        render_planning_analytics(run["analytics"])
 
     if run["warnings"]:
         with st.expander(f"Advertencias de calidad ({len(run['warnings'])})"):
