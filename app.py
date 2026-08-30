@@ -7,8 +7,6 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 import io
-import json
-import os
 import re
 import shutil
 import tempfile
@@ -21,7 +19,6 @@ import modelo_abasto as engine
 
 APP_NAME = "Transfer Planner"
 MAX_UPLOAD_MB = 500
-DRIVE_READ_SCOPE = "https://www.googleapis.com/auth/drive.readonly"
 
 
 st.set_page_config(
@@ -230,32 +227,6 @@ def inject_styles() -> None:
     )
 
 
-def optional_app_password_gate() -> None:
-    expected = ""
-    try:
-        expected = clean_secret(st.secrets.get("APP_PASSWORD", ""))
-    except (FileNotFoundError, KeyError):
-        pass
-    expected = expected or os.getenv("APP_PASSWORD", "")
-    if not expected:
-        return
-    if st.session_state.get("authenticated"):
-        return
-
-    st.markdown('<span class="section-label">ACCESO RESTRINGIDO</span>', unsafe_allow_html=True)
-    supplied = st.text_input("Contraseña", type="password")
-    if st.button("Entrar", use_container_width=True):
-        if supplied == expected:
-            st.session_state["authenticated"] = True
-            st.rerun()
-        st.error("Contraseña incorrecta")
-    st.stop()
-
-
-def clean_secret(value: Any) -> str:
-    return str(value).strip() if value is not None else ""
-
-
 def parse_origins(value: str) -> tuple[int, ...]:
     tokens = [token for token in re.split(r"[\s,;|]+", value.strip()) if token]
     if not tokens:
@@ -269,72 +240,6 @@ def parse_origins(value: str) -> tuple[int, ...]:
     if len(origins) != len(set(origins)):
         raise ValueError("La lista de orígenes contiene duplicados")
     return origins
-
-
-def get_data_transfers_id(default: str) -> str:
-    try:
-        configured = clean_secret(st.secrets.get("DATA_TRANSFERS_SPREADSHEET", ""))
-    except (FileNotFoundError, KeyError):
-        configured = ""
-    return configured or os.getenv("DATA_TRANSFERS_SPREADSHEET", "") or default
-
-
-def get_google_credentials():
-    import google.auth
-    from google.oauth2 import service_account
-
-    info: dict[str, Any] | None = None
-    try:
-        if "gcp_service_account" in st.secrets:
-            info = dict(st.secrets["gcp_service_account"])
-    except (FileNotFoundError, KeyError):
-        pass
-
-    raw_json = os.getenv("GCP_SERVICE_ACCOUNT_JSON", "").strip()
-    if raw_json:
-        info = json.loads(raw_json)
-
-    if info:
-        return service_account.Credentials.from_service_account_info(
-            info, scopes=[DRIVE_READ_SCOPE]
-        )
-
-    credentials, _ = google.auth.default(scopes=[DRIVE_READ_SCOPE])
-    return credentials
-
-
-def export_data_transfers(spreadsheet_ref: str, destination: Path) -> None:
-    from googleapiclient.discovery import build
-    from googleapiclient.http import MediaIoBaseDownload
-
-    spreadsheet_id = engine.extract_drive_id(
-        spreadsheet_ref, "DATA_TRANSFERS_SPREADSHEET"
-    )
-    drive = build(
-        "drive",
-        "v3",
-        credentials=get_google_credentials(),
-        cache_discovery=False,
-    )
-    metadata = drive.files().get(
-        fileId=spreadsheet_id, fields="id,name,mimeType"
-    ).execute()
-    if metadata["mimeType"] == "application/vnd.google-apps.spreadsheet":
-        request = drive.files().export_media(
-            fileId=spreadsheet_id,
-            mimeType=(
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            ),
-        )
-    else:
-        request = drive.files().get_media(fileId=spreadsheet_id)
-
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    with destination.open("wb") as handle:
-        downloader = MediaIoBaseDownload(handle, request, chunksize=8 * 1024 * 1024)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
 
 
 def save_uploaded_file(uploaded_file, destination: Path) -> None:
@@ -366,8 +271,6 @@ def clear_previous_workspace() -> None:
 def execute_planning(
     uploaded_plan,
     uploaded_catalog,
-    catalog_mode: str,
-    spreadsheet_ref: str,
     origins: tuple[int, ...],
     max_tasks: int,
     run_date,
@@ -382,15 +285,9 @@ def execute_planning(
     data_path = workspace / "input" / "DATA_TRANSFERS.xlsx"
 
     save_uploaded_file(uploaded_plan, plan_path)
-    if catalog_mode == "Google Sheet automático":
-        export_data_transfers(spreadsheet_ref, data_path)
-    else:
-        if uploaded_catalog is None:
-            raise ValueError("Sube DATA_TRANSFERS.xlsx para continuar")
-        save_uploaded_file(uploaded_catalog, data_path)
+    save_uploaded_file(uploaded_catalog, data_path)
 
     config = engine.Config(
-        data_transfers_spreadsheet=spreadsheet_ref,
         origin_warehouses=origins,
         max_tasks=max_tasks,
         run_date_override=run_date.strftime("%d-%m-%Y"),
@@ -488,37 +385,48 @@ def render_results(run: dict[str, Any]) -> None:
 
 def main() -> None:
     inject_styles()
-    optional_app_password_gate()
 
     st.markdown(
         """
         <section class="hero">
             <span class="hero-kicker">ABASTO / MX / WEB</span>
             <h1>TRANSFER<br>PLANNER.</h1>
-            <p>Sube el requerimiento, define los orígenes y ejecuta el mismo motor de planeación sin editar código.</p>
+            <p>Sube DATA_TRANSFERS y el requerimiento diario, define los orígenes y ejecuta el mismo motor sin editar código.</p>
         </section>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown('<span class="section-label">01 — PLAN DIARIO</span>', unsafe_allow_html=True)
+    st.markdown('<span class="section-label">01 — ARCHIVOS</span>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="info-strip">CSV de hasta 500 MB · El archivo se procesa temporalmente y no se guarda en Drive.</div>',
+        '<div class="info-strip">Todo se procesa temporalmente · No usa Google APIs · No guarda archivos en Drive.</div>',
         unsafe_allow_html=True,
     )
-    uploaded_plan = st.file_uploader(
-        "Arrastra aquí el archivo de requerimientos",
-        type=["csv"],
-        max_upload_size=MAX_UPLOAD_MB,
-        help="El archivo debe conservar las columnas originales del plan.",
-    )
+    file_left, file_right = st.columns(2)
+    with file_left:
+        uploaded_catalog = st.file_uploader(
+            "DATA_TRANSFERS.xlsx",
+            type=["xlsx"],
+            max_upload_size=MAX_UPLOAD_MB,
+            help="Descarga el Google Sheet como Microsoft Excel (.xlsx).",
+        )
+    with file_right:
+        uploaded_plan = st.file_uploader(
+            "Plan diario (.csv)",
+            type=["csv"],
+            max_upload_size=MAX_UPLOAD_MB,
+            help="El archivo debe conservar las columnas originales del plan.",
+        )
+    if uploaded_catalog is not None:
+        st.success(
+            f"{uploaded_catalog.name} · {uploaded_catalog.size / (1024 ** 2):,.1f} MB"
+        )
     if uploaded_plan is not None:
         st.success(
             f"{uploaded_plan.name} · {uploaded_plan.size / (1024 ** 2):,.1f} MB"
         )
 
     st.markdown('<span class="section-label">02 — VARIABLES</span>', unsafe_allow_html=True)
-    default_sheet = get_data_transfers_id(engine.CONFIG.data_transfers_spreadsheet)
     today_mx = datetime.now(ZoneInfo("America/Mexico_City")).date()
 
     with st.form("planning_config"):
@@ -565,22 +473,6 @@ def main() -> None:
                     step=1,
                 )
 
-            catalog_mode = st.radio(
-                "Fuente de DATA_TRANSFERS",
-                ["Google Sheet automático", "Subir XLSX manualmente"],
-                horizontal=True,
-            )
-            spreadsheet_ref = st.text_input(
-                "ID o URL de DATA_TRANSFERS",
-                value=default_sheet,
-                help="Se usa cuando seleccionas Google Sheet automático.",
-            )
-            uploaded_catalog = st.file_uploader(
-                "DATA_TRANSFERS.xlsx — solo para modo manual",
-                type=["xlsx"],
-                max_upload_size=MAX_UPLOAD_MB,
-            )
-
         submitted = st.form_submit_button(
             "EJECUTAR PLANEACIÓN →", use_container_width=True
         )
@@ -588,6 +480,9 @@ def main() -> None:
     if submitted:
         if uploaded_plan is None:
             st.error("Primero sube el CSV del plan diario.")
+            st.stop()
+        if uploaded_catalog is None:
+            st.error("Primero sube DATA_TRANSFERS.xlsx.")
             st.stop()
         try:
             origins = parse_origins(origins_text)
@@ -598,8 +493,6 @@ def main() -> None:
                 run = execute_planning(
                     uploaded_plan=uploaded_plan,
                     uploaded_catalog=uploaded_catalog,
-                    catalog_mode=catalog_mode,
-                    spreadsheet_ref=spreadsheet_ref,
                     origins=origins,
                     max_tasks=int(max_tasks),
                     run_date=run_date,
@@ -613,7 +506,7 @@ def main() -> None:
             st.session_state.pop("last_run", None)
             st.error(f"No se pudo completar la planeación: {exc}")
             st.info(
-                "Revisa el formato del CSV, el acceso a DATA_TRANSFERS y que los warehouses origen existan en TIENDA."
+                "Revisa el formato de ambos archivos y que los warehouses origen existan en TIENDA."
             )
 
     last_run = st.session_state.get("last_run")
