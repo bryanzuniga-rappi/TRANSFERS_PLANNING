@@ -59,6 +59,59 @@ REQUIRED_DATABASE_SHEETS = (
     "STORAGE",
 )
 
+SHEET_DESCRIPTIONS = {
+    "VOLUMETRIA": (
+        "Volumen en metros cúbicos por unidad de cada SKU. Se utiliza para "
+        "calcular el consumo de capacidad de recibo de las tiendas."
+    ),
+    "BLOQUEOS": (
+        "Productos con restricciones regionales de envío, especialmente desde "
+        "orígenes de CDMX hacia Guadalajara o Monterrey."
+    ),
+    "RUTA_COSTOS": (
+        "Combinaciones de tienda destino y producto que no cuentan con una ruta "
+        "de costos habilitada para la transferencia."
+    ),
+    "PRIORIDAD": (
+        "Prioridad de atención por warehouse destino. El valor 1 representa la "
+        "prioridad más alta."
+    ),
+    "HIGH_VALUE": (
+        "Clasificación referencial de productos de alto valor utilizada en los "
+        "archivos de salida."
+    ),
+    "RACKEADOS": (
+        "Productos rackeados por warehouse. Para el origen 444, estos productos "
+        "se excluyen completamente del stock utilizable."
+    ),
+    "CAP_RECIBO": (
+        "Capacidad máxima de recibo de cada tienda expresada en metros cúbicos."
+    ),
+    "COPERNICO": (
+        "Inventario detallado por ubicación del warehouse 444. Permite identificar "
+        "y descontar el stock no utilizable."
+    ),
+    "NO_DISPONIBLE": (
+        "Stock no disponible por warehouse y producto que debe descontarse del "
+        "inventario disponible final."
+    ),
+    "STOCK": (
+        "Stock disponible final por warehouse y producto. Es la fuente mandante "
+        "para determinar cuánto puede enviarse."
+    ),
+    "GOLDEN_INFALTABLES": (
+        "Productos Golden e Infaltables definidos por producto y ciudad, con "
+        "prioridad y excepciones especiales de negocio."
+    ),
+    "TIENDA": (
+        "Catálogo de warehouses con el nombre y la ciudad de cada tienda o nodo."
+    ),
+    "STORAGE": (
+        "Condición de almacenamiento de cada producto, como room temperature, "
+        "refrigerated o freezer."
+    ),
+}
+
 ENGLISH_MONTHS = {
     "JANUARY": 1,
     "FEBRUARY": 2,
@@ -224,6 +277,8 @@ def inject_styles() -> None:
             display: flex;
             flex-direction: column;
             justify-content: space-between;
+            position: relative;
+            overflow: hidden;
         }
 
         .source-card.ok { background: #baf264; }
@@ -250,6 +305,38 @@ def inject_styles() -> None:
             font-size: .78rem;
             font-weight: 900;
             text-transform: uppercase;
+        }
+
+        .source-card-tooltip {
+            position: absolute;
+            inset: 0;
+            z-index: 5;
+            box-sizing: border-box;
+            background: var(--ink);
+            color: var(--white);
+            padding: 12px 13px;
+            opacity: 0;
+            visibility: hidden;
+            overflow-y: auto;
+            font-size: .68rem;
+            font-weight: 700;
+            line-height: 1.35;
+            text-transform: none;
+            transition: opacity .12s ease, visibility 0s linear .12s;
+        }
+
+        .source-card-tooltip strong {
+            display: block;
+            color: var(--acid);
+            margin-bottom: 6px;
+            font-size: .67rem;
+            letter-spacing: .05em;
+        }
+
+        .source-card:hover .source-card-tooltip {
+            opacity: 1;
+            visibility: visible;
+            transition: opacity .12s ease 1s, visibility 0s linear 1s;
         }
 
         div[data-testid="stFileUploader"] {
@@ -587,11 +674,22 @@ def render_database_health(health: dict[str, Any]) -> None:
                 if row["TIPO"] == "ALEPH"
                 else "CONEXIÓN IMPORTRANGE"
             )
+            show_result = row["TIPO"] == "ALEPH" or row["ESTADO"] == "ERROR"
+            result_html = (
+                f'<div class="source-card-result">{html.escape(row["DETALLE"])}</div>'
+                if show_result
+                else ""
+            )
+            description = SHEET_DESCRIPTIONS.get(
+                row["HOJA"], "Fuente de información utilizada por el modelo de abasto."
+            )
             card_html = (
                 f'<div class="source-card {card_class}">'
                 f'<div><div class="source-card-name">{html.escape(row["HOJA"])}</div>'
                 f'<div class="source-card-meta">{card_meta}</div></div>'
-                f'<div class="source-card-result">{html.escape(row["DETALLE"])}</div>'
+                f'{result_html}'
+                f'<div class="source-card-tooltip"><strong>QUÉ CONTIENE</strong>'
+                f'{html.escape(description)}</div>'
                 '</div>'
             )
             with column:
