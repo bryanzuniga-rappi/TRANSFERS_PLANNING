@@ -173,6 +173,8 @@ BREAKDOWN_ORDER = (
     "CORTE POR PRODUCTO RACKEADO 444",
     "CORTE POR STOCK",
     "OK MANUAL POR FORECAST 0",
+    "OK MANUAL PARCIAL POR CUPO DE TAREAS",
+    "MANUAL NO EJECUTADO POR CUPO DE TAREAS",
     "OK COMPLETO POR FOUNTAIN9",
     "OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444",
     "OK PARCIAL - CORTE POR STOCK",
@@ -2308,6 +2310,20 @@ def apply_reporting_labels(result) -> None:
                 if demand_rule in MANUAL_FORECAST_ZERO_RULES
                 else "OK COMPLETO POR FOUNTAIN9"
             )
+        elif (
+            current_cut == "CORTE POR CAPACIDAD DE TAREAS"
+            and demand_rule in MANUAL_FORECAST_ZERO_RULES
+        ):
+            row["TIPO_DE_CORTE"] = (
+                "MANUAL NO EJECUTADO POR CUPO DE TAREAS"
+            )
+        elif (
+            current_cut == "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"
+            and demand_rule in MANUAL_FORECAST_ZERO_RULES
+        ):
+            row["TIPO_DE_CORTE"] = (
+                "OK MANUAL PARCIAL POR CUPO DE TAREAS"
+            )
         elif current_cut in cut_label_map:
             row["TIPO_DE_CORTE"] = cut_label_map[current_cut]
 
@@ -3684,6 +3700,15 @@ def execute_planning(
             blocked_cities,
             config,
         )
+        for row in active_plan_rows:
+            original_roq = engine.to_float(
+                row.get("ROQ_INPUT", row.get("MOV_ORIGINAL", 0.0)),
+                0.0,
+            )
+            target_quantity, _ = engine.calculate_target_quantity(row, config)
+            row["ES_MANUAL_FORECAST_ZERO"] = (
+                original_roq <= 0 and target_quantity > 0
+            )
 
         result = engine.plan_transfers(active_plan_rows, catalogs, config)
         for allocation in result.allocation_rows:
