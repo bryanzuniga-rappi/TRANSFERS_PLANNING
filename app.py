@@ -9,6 +9,7 @@ from zoneinfo import ZoneInfo
 import html
 import io
 import math
+import csv
 import re
 import shutil
 import tempfile
@@ -155,6 +156,8 @@ DEMAND_RULE_LABELS = {
     "HARDCODE_3_INVENTARIO_MENOR_DEMANDA": "ROQ 0 · INVENTARIO MENOR A DEMANDA",
     "SIN_DEMANDA": "SIN RECOMENDACIÓN",
     "AVL_DOH": "COBERTURA AVL POR DOH",
+    "PREVENTIVO_DOH": "BLINDAJE PREVENTIVO POR DOH",
+    "HARDCODE_3_NET_TRANSFER_BAJO": "NET TRANSFER BAJO · FORZADO A 3",
 }
 
 BREAKDOWN_ORDER = (
@@ -165,6 +168,7 @@ BREAKDOWN_ORDER = (
     "OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444",
     "OK PARCIAL - CORTE POR STOCK",
     "ENVIADOS PARA CUBRIR AVL",
+    "ENVIADOS PARA PREVENIR QUIEBRE",
     "SIN RECOMENDACIÓN",
     "CORTE POR RUTA DE COSTOS",
     "CORTE POR TIENDA CERRADA",
@@ -175,6 +179,15 @@ BREAKDOWN_ORDER = (
     "CORTE POR BLOQUEO REGIONAL",
     "OK PARCIAL - CORTE POR BLOQUEO REGIONAL",
     "ERROR DE DATOS",
+)
+
+INPUT_DESTINATION_COLUMNS = ("Warehouseid", "Node_Store")
+INPUT_PLAN_COLUMNS = (
+    "SKU ID",
+    "Predicted Demand for selected duration",
+    "Predicted Opening Inventory",
+    "Replenishment Quantity for Plan Duration (MOV)",
+    "Net Inter-Store Transfers",
 )
 
 INSUMOS_COLUMNS = [
@@ -892,6 +905,265 @@ def save_uploaded_file(uploaded_file, destination: Path) -> None:
     uploaded_file.seek(0)
 
 
+def consolidate_plan_files(
+    plan_paths: list[Path],
+    catalogs,
+    config: engine.Config,
+    output_path: Path,
+) -> tuple[Path, dict[tuple[int, int], dict[str, Any]], dict[str, Any]]:
+    """Suma archivos y produce el CSV canónico que consume el motor."""
+    if not plan_paths:
+        raise ValueError("Debes cargar al menos un archivo de planeación.")
+
+    numeric_columns = list(INPUT_PLAN_COLUMNS)
+    consolidated: dict[tuple[int, int], dict[str, Any]] = {}
+    source_row_count = 0
+    source_counts: Counter[str] = Counter()
+
+    for path in plan_paths:
+        with path.open(
+            "r",
+            encoding="utf-8-sig",
+            errors="replace",
+            newline="",
+        ) as handle:
+            sample = handle.read(8192)
+            handle.seek(0)
+            try:
+                dialect = csv.Sniffer().sniff(sample, delimiters=",;\t")
+            except csv.Error:
+                dialect = csv.excel
+            reader = csv.DictReader(handle, dialect=dialect)
+            if reader.fieldnames is None:
+                raise ValueError(f"{path.name}: el archivo no contiene encabezados.")
+            field_lookup = {
+                engine.normalize_header(name): name for name in reader.fieldnames
+            }
+            destination_fields = [
+                field_lookup[engine.normalize_header(alias)]
+                for alias in INPUT_DESTINATION_COLUMNS
+                if engine.normalize_header(alias) in field_lookup
+            ]
+            if not destination_fields:
+                raise ValueError(
+                    f"{path.name}: falta Warehouseid o Node_Store. "
+                    "Una de estas dos columnas es obligatoria."
+                )
+
+            net_transfer_aliases = {
+                engine.normalize_header("Net Inter-Store Transfers"),
+                engine.normalize_header("Net Inter Store Transfers"),
+            }
+            required_lookup: dict[str, str] = {}
+            missing: list[str] = []
+            for column in numeric_columns:
+                normalized = engine.normalize_header(column)
+                if column == "Net Inter-Store Transfers":
+                    match = next(
+                        (
+                            field_lookup[alias]
+                            for alias in net_transfer_aliases
+                            if alias in field_lookup
+                        ),
+                        None,
+                    )
+                else:
+                    match = field_lookup.get(normalized)
+                if match is None:
+                    missing.append(column)
+                else:
+                    required_lookup[column] = match
+            if missing:
+                raise ValueError(
+                    f"{path.name}: faltan columnas obligatorias: {missing}."
+                )
+
+            for csv_row, raw in enumerate(reader, start=2):
+                if not any(engine.clean_text(value) for value in raw.values()):
+                    continue
+                destination_values: list[int] = []
+                for destination_field in destination_fields:
+                    raw_destination = raw.get(destination_field, "")
+                    if engine.clean_text(raw_destination):
+                        destination_values.append(
+                            engine.to_id(
+                                raw_destination,
+                                f"{path.name} fila {csv_row}.{destination_field}",
+                            )
+                        )
+                if not destination_values:
+                    raise ValueError(
+                        f"{path.name} fila {csv_row}: Warehouseid/Node_Store vacío."
+                    )
+                if len(set(destination_values)) > 1:
+                    raise ValueError(
+                        f"{path.name} fila {csv_row}: Warehouseid y Node_Store "
+                        f"no coinciden ({destination_values})."
+                    )
+                destination = destination_values[0]
+                sku_field = required_lookup["SKU ID"]
+                sku = engine.to_id(
+                    raw.get(sku_field, ""),
+                    f"{path.name} fila {csv_row}.SKU ID",
+                )
+                key = (destination, sku)
+                if key not in consolidated:
+                    consolidated[key] = {
+                        "WAREHOUSE_DESTINATION": destination,
+                        "RETAIL_ID": sku,
+                        "PREDICTED_DEMAND": 0.0,
+                        "PREDICTED_OPENING_INVENTORY": 0.0,
+                        "ROQ_INPUT": 0.0,
+                        "NET_INTER_STORE_TRANSFERS": 0.0,
+                        "SOURCE_FILES": set(),
+                        "SOURCE_ROWS": 0,
+                    }
+                record = consolidated[key]
+                record["PREDICTED_DEMAND"] += engine.to_float(
+                    raw.get(required_lookup["Predicted Demand for selected duration"], "")
+                )
+                record["PREDICTED_OPENING_INVENTORY"] += engine.to_float(
+                    raw.get(required_lookup["Predicted Opening Inventory"], "")
+                )
+                record["ROQ_INPUT"] += engine.to_float(
+                    raw.get(
+                        required_lookup[
+                            "Replenishment Quantity for Plan Duration (MOV)"
+                        ],
+                        "",
+                    )
+                )
+                record["NET_INTER_STORE_TRANSFERS"] += engine.to_float(
+                    raw.get(required_lookup["Net Inter-Store Transfers"], "")
+                )
+                record["SOURCE_FILES"].add(path.name)
+                record["SOURCE_ROWS"] += 1
+                source_row_count += 1
+                source_counts[path.name] += 1
+
+    if not consolidated:
+        raise ValueError("Los archivos cargados no contienen requerimientos válidos.")
+
+    output_rows: list[dict[str, Any]] = []
+    net_transfer_hardcodes = 0
+    for key, record in consolidated.items():
+        destination, sku = key
+        destination_stock = max(
+            float(catalogs.stock_base.get((destination, sku), 0.0)),
+            0.0,
+        )
+        demand = record["PREDICTED_DEMAND"]
+        opening = record["PREDICTED_OPENING_INVENTORY"]
+        roq_input = record["ROQ_INPUT"]
+        net_transfer = record["NET_INTER_STORE_TRANSFERS"]
+        zero_total_rule = (
+            math.isclose(demand, 0.0, abs_tol=1e-9)
+            and math.isclose(opening, 0.0, abs_tol=1e-9)
+        )
+        deficit_rule = opening < demand
+        net_transfer_rule = (
+            roq_input <= 0
+            and net_transfer <= 3
+            and destination_stock < 3
+            and not zero_total_rule
+            and not deficit_rule
+        )
+        record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
+        effective_roq = 3.0 if net_transfer_rule else roq_input
+        net_transfer_hardcodes += int(net_transfer_rule)
+        output_rows.append(
+            {
+                "Warehouseid": destination,
+                "SKU ID": sku,
+                "Current Inventory": destination_stock,
+                "Predicted Demand for selected duration": demand,
+                "Predicted Opening Inventory": opening,
+                "Replenishment Quantity for Plan Duration (MOV)": effective_roq,
+                "Net Inter-Store Transfers": net_transfer,
+            }
+        )
+
+    canonical_columns = [
+        "Warehouseid",
+        "SKU ID",
+        "Current Inventory",
+        "Predicted Demand for selected duration",
+        "Predicted Opening Inventory",
+        "Replenishment Quantity for Plan Duration (MOV)",
+        "Net Inter-Store Transfers",
+    ]
+    output_rows.sort(key=lambda row: (row["Warehouseid"], row["SKU ID"]))
+    engine.write_csv(output_path, output_rows, canonical_columns)
+
+    unique_count = len(consolidated)
+    duplicated_keys = sum(
+        int(record["SOURCE_ROWS"] > 1) for record in consolidated.values()
+    )
+    summary = {
+        "files": len(plan_paths),
+        "file_names": [path.name for path in plan_paths],
+        "source_rows": source_row_count,
+        "unique_requirements": unique_count,
+        "rows_consolidated": max(source_row_count - unique_count, 0),
+        "duplicated_keys": duplicated_keys,
+        "net_transfer_hardcodes": net_transfer_hardcodes,
+        "rows_by_file": dict(source_counts),
+    }
+    return output_path, consolidated, summary
+
+
+def enrich_consolidated_plan_read(
+    plan_read,
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+    consolidation_summary: dict[str, Any],
+) -> None:
+    """Restaura trazabilidad y métricas originales después de normalizar el CSV."""
+    for row in plan_read.rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        source = consolidated[key]
+        row["NET_INTER_STORE_TRANSFERS"] = source[
+            "NET_INTER_STORE_TRANSFERS"
+        ]
+        row["ROQ_INPUT"] = source["ROQ_INPUT"]
+        row["NET_TRANSFER_HARDCODE_3"] = source["NET_TRANSFER_HARDCODE_3"]
+        row["SOURCE_FILES"] = " | ".join(sorted(source["SOURCE_FILES"]))
+        row["SOURCE_ROWS"] = source["SOURCE_ROWS"]
+
+    plan_read.input_row_count = consolidation_summary["source_rows"]
+    plan_read.duplicate_row_count = consolidation_summary["rows_consolidated"]
+    plan_read.duplicate_key_count = consolidation_summary["duplicated_keys"]
+    plan_read.conflicting_duplicate_key_count = 0
+    if consolidation_summary["rows_consolidated"]:
+        plan_read.warnings.append(
+            "Archivos múltiples: se sumaron y consolidaron "
+            f"{consolidation_summary['source_rows']:,} filas en "
+            f"{consolidation_summary['unique_requirements']:,} combinaciones "
+            "Warehouse-SKU."
+        )
+
+
+def attach_consolidated_input_to_result(
+    result,
+    consolidated: dict[tuple[int, int], dict[str, Any]],
+) -> None:
+    """Agrega al reporte Net Transfers y conserva el ROQ realmente recibido."""
+    for row in result.base_rows:
+        key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+        source = consolidated.get(key)
+        if source is None:
+            row.setdefault("NET_INTER_STORE_TRANSFERS", "")
+            row.setdefault("ARCHIVOS_INPUT", "CATALOGO")
+            continue
+        row["NET_INTER_STORE_TRANSFERS"] = source[
+            "NET_INTER_STORE_TRANSFERS"
+        ]
+        row["ARCHIVOS_INPUT"] = " | ".join(sorted(source["SOURCE_FILES"]))
+        row["FILAS_INPUT_SUMADAS"] = source["SOURCE_ROWS"]
+        if source["NET_TRANSFER_HARDCODE_3"]:
+            row["MOV_ORIGINAL"] = source["ROQ_INPUT"]
+            row["REGLA_DEMANDA"] = "HARDCODE_3_NET_TRANSFER_BAJO"
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_public_database() -> bytes:
     """Exporta el Google Sheet público completo como XLSX y conserva 5 min de caché."""
@@ -1403,6 +1675,11 @@ def build_planning_analytics(
         for row in eligible_rows
         if row["REGLA_DEMANDA"] == "HARDCODE_3_INVENTARIO_MENOR_DEMANDA"
     ]
+    net_transfer_forced = [
+        row
+        for row in eligible_rows
+        if row["REGLA_DEMANDA"] == "HARDCODE_3_NET_TRANSFER_BAJO"
+    ]
     minimum_three_applied = [
         row
         for row in eligible_rows
@@ -1769,6 +2046,10 @@ def build_planning_analytics(
             "deficit_forced_served_cases": sum(
                 row["CANTIDAD_ASIGNADA"] > 0 for row in deficit_forced
             ),
+            "net_transfer_forced_cases": len(net_transfer_forced),
+            "net_transfer_forced_served_cases": sum(
+                row["CANTIDAD_ASIGNADA"] > 0 for row in net_transfer_forced
+            ),
             "minimum_three_cases": len(minimum_three_applied),
             "golden_cases": len(golden_rows),
             "golden_served_cases": sum(
@@ -2128,6 +2409,7 @@ def empty_avl_summary(enabled: bool, doh: float) -> dict[str, Any]:
         "doh": float(doh),
         "catalog_rows": 0,
         "stockout_candidates": 0,
+        "preventive_candidates": 0,
         "cases_sent": 0,
         "cases_full": 0,
         "cases_partial": 0,
@@ -2157,9 +2439,15 @@ def apply_avl_fill(
     closed_store_ids: set[int],
     blocked_cities: tuple[str, ...],
     doh: float,
+    *,
+    candidate_mode: str = "stockout",
+    excluded_keys: set[tuple[int, int]] | None = None,
 ) -> dict[str, Any]:
-    """Usa tareas remanentes para cubrir stockouts del catálogo por ADU x DOH."""
+    """Usa tareas remanentes para stockouts o inventario preventivo del catálogo."""
+    if candidate_mode not in {"stockout", "preventive"}:
+        raise ValueError(f"Modo de cobertura de catálogo inválido: {candidate_mode}")
     summary = empty_avl_summary(True, doh)
+    summary["mode"] = candidate_mode
     summary["catalog_rows"] = len(catalog_rows)
     summary["task_slots_before"] = max(config.max_tasks - result.tasks_used, 0)
     for base_row in result.base_rows:
@@ -2175,6 +2463,7 @@ def apply_avl_fill(
         for row in result.allocation_rows
         if int(row.get("QUANTITY", 0) or 0) > 0
     }
+    excluded_key_set = set(excluded_keys or ())
     base_row_by_key = {
         (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row
         for row in result.base_rows
@@ -2222,11 +2511,27 @@ def apply_avl_fill(
         if key not in catalogs.stock_base:
             summary["skipped_missing_stock"] += 1
             continue
-        if catalogs.stock_base[key] > 0:
-            summary["skipped_not_stockout"] += 1
-            continue
-        summary["stockout_candidates"] += 1
-        if key in assigned_keys:
+        destination_stock = max(float(catalogs.stock_base[key]), 0.0)
+        adu = float(catalog_row["ADU"])
+        current_doh = destination_stock / adu if adu > 0 else math.inf
+        if candidate_mode == "stockout":
+            if destination_stock > 0:
+                summary["skipped_not_stockout"] += 1
+                continue
+            target = max(int(math.ceil(adu * doh)), 3)
+            summary["stockout_candidates"] += 1
+        else:
+            if destination_stock <= 0 or not (
+                destination_stock < 3 or current_doh < 1
+            ):
+                summary["skipped_not_stockout"] += 1
+                continue
+            target = max(
+                int(math.ceil(max((adu * doh) - destination_stock, 0.0))),
+                3,
+            )
+            summary["preventive_candidates"] += 1
+        if key in assigned_keys or key in excluded_key_set:
             summary["skipped_already_served"] += 1
             continue
         if key in catalogs.route_cost_blocks:
@@ -2241,7 +2546,10 @@ def apply_avl_fill(
             {
                 "WAREHOUSE_DESTINATION": destination,
                 "RETAIL_ID": sku,
-                "ADU": float(catalog_row["ADU"]),
+                "ADU": adu,
+                "DESTINATION_STOCK": destination_stock,
+                "CURRENT_DOH": current_doh,
+                "TARGET": target,
                 "STORE": store,
                 "IS_GOLDEN": is_golden,
                 "PRIORITY": catalogs.store_priority.get(destination, 100),
@@ -2252,6 +2560,8 @@ def apply_avl_fill(
         key=lambda row: (
             0 if row["IS_GOLDEN"] else 1,
             row["PRIORITY"],
+            row["CURRENT_DOH"],
+            row["DESTINATION_STOCK"],
             row["WAREHOUSE_DESTINATION"],
             row["RETAIL_ID"],
         )
@@ -2298,7 +2608,7 @@ def apply_avl_fill(
             summary["skipped_capacity"] += 1
             continue
 
-        target = max(int(math.ceil(candidate["ADU"] * doh)), 3)
+        target = int(candidate["TARGET"])
         origin_info: dict[int, dict[str, Any]] = {}
         origin_before: dict[int, int] = {}
         regional_blocks: dict[int, bool] = {}
@@ -2414,17 +2724,24 @@ def apply_avl_fill(
             "PREDICTED_DEMAND": previous_row.get("PREDICTED_DEMAND", 0)
             if previous_row
             else 0,
-            "CURRENT_INVENTORY": catalogs.stock_base.get((destination, sku), 0),
+            "CURRENT_INVENTORY": candidate["DESTINATION_STOCK"],
             "MOV_ORIGINAL": 0,
-            "REGLA_DEMANDA": "AVL_DOH",
+            "REGLA_DEMANDA": (
+                "AVL_DOH" if candidate_mode == "stockout" else "PREVENTIVO_DOH"
+            ),
             "ADU_CATALOGO": candidate["ADU"],
             "DOH_AVL": doh,
+            "DOH_DESTINO_ANTES": (
+                round(candidate["CURRENT_DOH"], 3)
+                if math.isfinite(candidate["CURRENT_DOH"])
+                else ""
+            ),
             "CANTIDAD_OBJETIVO": target,
             "CANTIDAD_ASIGNADA": assigned,
             "CANTIDAD_FALTANTE": max(target - assigned, 0),
             "ES_GOLDEN_INFALTABLE": is_golden,
             "PRIORIDAD_TIENDA": candidate["PRIORITY"],
-            "ES_STOCKOUT": True,
+            "ES_STOCKOUT": candidate["DESTINATION_STOCK"] <= 0,
             "SIN_RUTA_COSTOS": False,
             "M3_POR_UNIDAD": m3_per_unit,
             "M3_OBJETIVO": target * m3_per_unit,
@@ -2445,10 +2762,22 @@ def apply_avl_fill(
             ),
             "STORAGE": resolved_storage(catalogs.storage.get(sku)),
             "VALUE": catalogs.high_value.get(sku, "REGULAR"),
-            "TIPO_DE_CORTE": "ENVIADOS PARA CUBRIR AVL",
+            "TIPO_DE_CORTE": (
+                "ENVIADOS PARA CUBRIR AVL"
+                if candidate_mode == "stockout"
+                else "ENVIADOS PARA PREVENIR QUIEBRE"
+            ),
             "DETALLE_MOTIVO": (
-                f"Stockout en destino; cobertura de {doh:g} DOH con "
-                f"ADU {candidate['ADU']:.4f}. Asignadas {assigned} de {target}."
+                (
+                    "Stockout en destino"
+                    if candidate_mode == "stockout"
+                    else (
+                        f"Inventario preventivo: {candidate['DESTINATION_STOCK']:g} "
+                        f"unidades y {candidate['CURRENT_DOH']:.3f} DOH antes del envío"
+                    )
+                )
+                + f"; objetivo de cobertura {doh:g} DOH con ADU "
+                f"{candidate['ADU']:.4f}. Asignadas {assigned} de {target}."
             ),
         }
         for source in config.origin_warehouses:
@@ -2504,7 +2833,9 @@ def write_executive_pdf(
     closed_stores: dict[str, Any],
     insumos: dict[str, Any],
     avl: dict[str, Any],
+    preventive: dict[str, Any],
     fruver_811: dict[str, Any],
+    input_consolidation: dict[str, Any],
 ) -> None:
     """Genera un reporte PDF ejecutivo, legible y listo para compartir."""
     path.parent.mkdir(parents=True, exist_ok=True)
@@ -2714,12 +3045,14 @@ def write_executive_pdf(
         [
             para("Demanda Fountain9", table_header_style),
             para("Stockouts", table_header_style),
-            para("Cobertura AVL", table_header_style),
+            para("Coberturas de catálogo", table_header_style),
             para("Exclusiones y extras", table_header_style),
         ],
         [
             para(
-                f"{input_requirements:,} casos únicos recibidos; "
+                f"{input_consolidation.get('files', 1):,} archivo(s) y "
+                f"{input_consolidation.get('source_rows', input_requirements):,} "
+                f"filas consolidadas en {input_requirements:,} casos únicos; "
                 f"{evaluated_requirements:,} evaluados. "
                 f"{summary['fully_covered_cases']:,} quedaron completos y "
                 f"{summary['partial_cases']:,} parciales.",
@@ -2733,12 +3066,22 @@ def write_executive_pdf(
             ),
             para(
                 (
-                    f"Activada a {avl['doh']:g} DOH: "
-                    f"{avl['cases_sent']:,} casos, {avl['tasks_added']:,} tareas y "
-                    f"{avl['units_added']:,} unidades adicionales."
+                    (
+                        f"AVL stockout a {avl['doh']:g} DOH: "
+                        f"{avl['cases_sent']:,} casos y {avl['units_added']:,} unidades. "
+                    )
+                    if avl.get("enabled")
+                    else "AVL stockout desactivado. "
                 )
-                if avl.get("enabled")
-                else "Cobertura AVL desactivada en esta ejecución.",
+                + (
+                    (
+                        f"Preventivo: {preventive['cases_sent']:,} casos, "
+                        f"{preventive['tasks_added']:,} tareas y "
+                        f"{preventive['units_added']:,} unidades."
+                    )
+                    if preventive.get("enabled")
+                    else "Blindaje preventivo desactivado."
+                ),
                 body_style,
             ),
             para(
@@ -3026,7 +3369,7 @@ def write_executive_pdf(
 
 
 def execute_planning(
-    uploaded_plan,
+    uploaded_plans,
     database_bytes: bytes,
     origins: tuple[int, ...],
     max_tasks: int,
@@ -3036,14 +3379,33 @@ def execute_planning(
     include_avl_fill: bool = False,
     avl_doh: float = 3.0,
     block_fruver_811: bool = False,
+    include_preventive_fill: bool = False,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
     st.session_state["last_workspace"] = str(workspace)
-    plan_path = workspace / "input" / Path(uploaded_plan.name).name
-    data_path = workspace / "input" / "DATA_TRANSFERS.xlsx"
+    input_dir = workspace / "input"
+    data_path = input_dir / "DATA_TRANSFERS.xlsx"
+    canonical_plan_path = input_dir / (
+        f"Plan_Consolidado_{run_date:%d-%m-%Y}.csv"
+    )
 
-    save_uploaded_file(uploaded_plan, plan_path)
+    uploaded_plan_list = list(uploaded_plans or [])
+    plan_paths: list[Path] = []
+    used_names: Counter[str] = Counter()
+    for index, uploaded_plan in enumerate(uploaded_plan_list, start=1):
+        raw_name = engine.safe_filename(Path(uploaded_plan.name).name) or (
+            f"plan_{index}.csv"
+        )
+        used_names[raw_name] += 1
+        saved_name = (
+            raw_name
+            if used_names[raw_name] == 1
+            else f"{index:02d}_{raw_name}"
+        )
+        plan_path = input_dir / saved_name
+        save_uploaded_file(uploaded_plan, plan_path)
+        plan_paths.append(plan_path)
     save_database(database_bytes, data_path)
 
     config = engine.Config(
@@ -3081,7 +3443,20 @@ def execute_planning(
                 catalogs,
             )
             catalogs.warnings.extend(insumos_warnings)
+        plan_path, consolidated_input, consolidation_summary = (
+            consolidate_plan_files(
+                plan_paths,
+                catalogs,
+                config,
+                canonical_plan_path,
+            )
+        )
         plan_read = engine.read_plan_csv(plan_path, config)
+        enrich_consolidated_plan_read(
+            plan_read,
+            consolidated_input,
+            consolidation_summary,
+        )
         rows_after_closed_stores, closed_plan_rows = (
             split_plan_rows_by_closed_store(
                 plan_read.rows,
@@ -3096,6 +3471,11 @@ def execute_planning(
 
         result = engine.plan_transfers(active_plan_rows, catalogs, config)
         result.warnings.extend(plan_read.warnings)
+        fountain_recommended_keys = {
+            (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
+            for row in result.base_rows
+            if int(row.get("CANTIDAD_OBJETIVO", 0) or 0) > 0
+        }
         closed_summary = closed_store_summary(
             closed_plan_rows,
             closed_store_ids,
@@ -3123,13 +3503,17 @@ def execute_planning(
                 f"{len(blocked_plan_rows):,} requerimientos antes de asignar stock."
             )
 
-        avl_summary = empty_avl_summary(include_avl_fill, avl_doh)
-        if include_avl_fill:
+        catalog_fill_rows: list[dict[str, Any]] = []
+        if include_avl_fill or include_preventive_fill:
             avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
             result.warnings.extend(avl_warnings)
+            catalog_fill_rows = avl_catalog_rows
+
+        avl_summary = empty_avl_summary(include_avl_fill, avl_doh)
+        if include_avl_fill:
             avl_summary = apply_avl_fill(
                 result,
-                avl_catalog_rows,
+                catalog_fill_rows,
                 catalogs,
                 config,
                 closed_store_ids,
@@ -3144,6 +3528,33 @@ def execute_planning(
                 "tareas remanentes."
             )
 
+        preventive_summary = empty_avl_summary(
+            include_preventive_fill,
+            avl_doh,
+        )
+        preventive_summary["mode"] = "preventive"
+        if include_preventive_fill:
+            preventive_summary = apply_avl_fill(
+                result,
+                catalog_fill_rows,
+                catalogs,
+                config,
+                closed_store_ids,
+                blocked_cities,
+                avl_doh,
+                candidate_mode="preventive",
+                excluded_keys=fountain_recommended_keys,
+            )
+            result.warnings.append(
+                f"Blindaje preventivo ({avl_doh:g} DOH): se agregaron "
+                f"{preventive_summary['cases_sent']:,} casos, "
+                f"{preventive_summary['tasks_added']:,} tareas y "
+                f"{preventive_summary['units_added']:,} unidades para inventarios "
+                "con menos de 1 DOH o menos de 3 unidades, sin recomendación "
+                "positiva de Fountain9."
+            )
+
+        attach_consolidated_input_to_result(result, consolidated_input)
         normalize_result_storage(result)
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
@@ -3203,10 +3614,16 @@ def execute_planning(
             closed_stores=closed_summary,
             insumos=insumos_summary,
             avl=avl_summary,
+            preventive=preventive_summary,
             fruver_811=fruver_811_summary,
+            input_consolidation=consolidation_summary,
         )
         local_files.append(pdf_path)
         print(f"Requerimientos únicos del input: {len(plan_read.rows):,}")
+        print(
+            f"Archivos consolidados: {consolidation_summary['files']:,} / "
+            f"filas sumadas: {consolidation_summary['source_rows']:,}"
+        )
         print(f"Requerimientos activos: {len(active_plan_rows):,}")
         print(
             "Requerimientos excluidos por tiendas cerradas: "
@@ -3219,6 +3636,13 @@ def execute_planning(
                 f"Cobertura AVL: {avl_summary['cases_sent']:,} casos / "
                 f"{avl_summary['tasks_added']:,} tareas / "
                 f"{avl_summary['units_added']:,} unidades"
+            )
+        if preventive_summary["enabled"]:
+            print(
+                "Blindaje preventivo: "
+                f"{preventive_summary['cases_sent']:,} casos / "
+                f"{preventive_summary['tasks_added']:,} tareas / "
+                f"{preventive_summary['units_added']:,} unidades"
             )
         if insumos_summary["enabled"]:
             print(
@@ -3249,7 +3673,9 @@ def execute_planning(
         "closed_stores": closed_summary,
         "insumos": insumos_summary,
         "avl": avl_summary,
+        "preventive": preventive_summary,
         "fruver_811": fruver_811_summary,
+        "input_consolidation": consolidation_summary,
     }
 
 
@@ -3909,7 +4335,28 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
                     "cuyo objetivo fue forzado a tres unidades."
                 ),
             },
-        ]
+            {
+                "category": "CASOS · NET TRANSFER",
+                "label": "RIESGO BAJO · FORZADO A 3",
+                "value": f"{summary.get('net_transfer_forced_cases', 0):,}",
+                "description": (
+                    "Casos sin ROQ positivo, con Net Inter-Store Transfers menor o "
+                    "igual a 3 e inventario final en tienda menor a 3 unidades cuyo "
+                    "objetivo fue forzado a tres."
+                ),
+                "tone": "coral",
+            },
+            {
+                "category": "CASOS · ROQ POSITIVO",
+                "label": "MÍNIMO DE 3 APLICADO",
+                "value": f"{summary['minimum_three_cases']:,}",
+                "description": (
+                    "Casos cuyo ROQ original era positivo pero menor a tres y se "
+                    "elevó al mínimo operativo de tres unidades."
+                ),
+            },
+        ],
+        columns_count=3,
     )
 
     st.markdown('<span class="section-label">STOCKOUTS + PRIORIDADES</span>', unsafe_allow_html=True)
@@ -4014,8 +4461,8 @@ def render_results(run: dict[str, Any]) -> None:
                 "label": "REQUERIMIENTOS ÚNICOS RECIBIDOS",
                 "value": f"{run.get('input_requirements', run['requirements']):,}",
                 "description": (
-                    "Combinaciones tienda–SKU únicas leídas del CSV después de "
-                    "consolidar duplicados. Incluye tiendas cerradas y ciudades "
+                    "Combinaciones tienda–SKU únicas obtenidas después de sumar todos "
+                    "los CSV cargados. Incluye tiendas cerradas y ciudades "
                     "bloqueadas antes de aplicar exclusiones."
                 ),
                 "tone": "acid",
@@ -4072,6 +4519,56 @@ def render_results(run: dict[str, Any]) -> None:
         columns_count=3,
     )
 
+    consolidation = run.get("input_consolidation", {})
+    if consolidation:
+        st.markdown(
+            '<span class="section-label">CONSOLIDACIÓN DE ARCHIVOS</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "ARCHIVOS · INPUT",
+                    "label": "CSV CARGADOS",
+                    "value": f"{consolidation.get('files', 0):,}",
+                    "description": (
+                        "Número de archivos cargados en esta corrida. Cada uno puede "
+                        "usar Warehouseid o Node_Store para identificar la tienda."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "FILAS · INPUT",
+                    "label": "FILAS LEÍDAS",
+                    "value": f"{consolidation.get('source_rows', 0):,}",
+                    "description": (
+                        "Filas no vacías leídas entre todos los CSV antes de consolidar."
+                    ),
+                },
+                {
+                    "category": "CASOS · CONSOLIDADOS",
+                    "label": "TIENDA–SKU ÚNICOS",
+                    "value": f"{consolidation.get('unique_requirements', 0):,}",
+                    "description": (
+                        "Combinaciones únicas de tienda y SKU resultantes. Las métricas "
+                        "de demanda, apertura, ROQ y Net Transfers se suman por caso."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "FILAS · SUMADAS",
+                    "label": "FILAS CONSOLIDADAS",
+                    "value": f"{consolidation.get('rows_consolidated', 0):,}",
+                    "description": (
+                        "Filas adicionales absorbidas al coincidir en Warehouse–SKU. "
+                        "No se duplican como requerimientos separados."
+                    ),
+                    "tone": "coral",
+                },
+            ],
+            columns_count=4,
+        )
+
     avl = run.get("avl", {})
     if avl.get("enabled"):
         st.markdown(
@@ -4121,6 +4618,67 @@ def render_results(run: dict[str, Any]) -> None:
             f"{avl.get('cases_sent', 0):,} casos, "
             f"{avl.get('tasks_added', 0):,} tareas y "
             f"{avl.get('units_added', 0):,} unidades adicionales."
+        )
+
+    preventive = run.get("preventive", {})
+    if preventive.get("enabled"):
+        st.markdown(
+            '<span class="section-label">BLINDAJE PREVENTIVO · ÚLTIMA PASADA</span>',
+            unsafe_allow_html=True,
+        )
+        render_kpi_cards(
+            [
+                {
+                    "category": "CASOS · PREVENTIVOS",
+                    "label": "POSIBLES QUIEBRES ATENDIDOS",
+                    "value": f"{preventive.get('cases_sent', 0):,}",
+                    "description": (
+                        "Combinaciones tienda–SKU del catálogo con inventario positivo, "
+                        "pero menor a 1 DOH o menor a 3 unidades, que recibieron envío. "
+                        "No tenían recomendación positiva de Fountain9."
+                    ),
+                    "tone": "acid",
+                },
+                {
+                    "category": "TAREAS · PREVENTIVAS",
+                    "label": "TAREAS SOBRANTES UTILIZADAS",
+                    "value": f"{preventive.get('tasks_added', 0):,}",
+                    "description": (
+                        "Líneas operativas adicionales creadas por el blindaje. Solo "
+                        "utiliza las tareas que quedaron disponibles después de "
+                        "Fountain9 y, si está activo, de AVL stockout."
+                    ),
+                    "tone": "blue",
+                },
+                {
+                    "category": "UNIDADES · PREVENTIVAS",
+                    "label": "UNIDADES DE BLINDAJE",
+                    "value": f"{preventive.get('units_added', 0):,}",
+                    "description": (
+                        f"Unidades adicionales para acercar los casos a "
+                        f"{preventive.get('doh', 0):g} DOH. El envío mínimo es 3 "
+                        "unidades, salvo que el stock permitido disponible sea menor."
+                    ),
+                    "tone": "coral",
+                },
+                {
+                    "category": "CASOS · CANDIDATOS",
+                    "label": "RIESGOS DETECTADOS",
+                    "value": f"{preventive.get('preventive_candidates', 0):,}",
+                    "description": (
+                        "Casos del catálogo que cumplieron el umbral de riesgo antes "
+                        "de revisar si ya fueron atendidos, rutas, capacidad, stock de "
+                        "origen y tareas disponibles."
+                    ),
+                },
+            ],
+            columns_count=4,
+        )
+        st.success(
+            f"Blindaje preventivo a {preventive.get('doh', 0):g} DOH: "
+            f"{preventive.get('cases_sent', 0):,} casos, "
+            f"{preventive.get('tasks_added', 0):,} tareas y "
+            f"{preventive.get('units_added', 0):,} unidades adicionales."
         )
 
     fruver_811 = run.get("fruver_811", {})
@@ -4214,9 +4772,9 @@ def main() -> None:
     st.markdown(
         """
         <section class="hero">
-            <span class="hero-kicker">Turbo MX</span>
+            <span class="hero-kicker">ABASTO / MX / WEB</span>
             <h1>TRANSFER<br>PLANNER.</h1>
-            <p>Sube el export de Fountain9 para que asigne el inventario dado el mejor site. Este modelo no hace calculos sobre la necesidad original de Fountain9, para sugeridos, forecast, envíos, siempre usar la funete original</p>
+            <p>Sube el requerimiento diario, define los orígenes y ejecuta el mismo motor sin editar código. La base se consulta y valida automáticamente.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -4248,16 +4806,47 @@ def main() -> None:
         st.rerun()
 
     st.markdown('<span class="section-label">02 — ARCHIVO DE PLANEACIÓN</span>', unsafe_allow_html=True)
-    uploaded_plan = st.file_uploader(
-        "Plan diario (.csv)",
+    uploaded_plans = st.file_uploader(
+        "Archivos de planeación (.csv)",
         type=["csv"],
+        accept_multiple_files=True,
         max_upload_size=MAX_UPLOAD_MB,
-        help="El archivo debe conservar las columnas originales del plan.",
+        help=(
+            "Puedes cargar uno o varios CSV. La tienda puede venir como Warehouseid "
+            "o Node_Store; el sistema suma los archivos y consolida cada combinación "
+            "tienda–SKU antes de planear. Las demás dimensiones se obtienen de la "
+            "base de datos."
+        ),
     )
-    if uploaded_plan is not None:
-        st.success(
-            f"{uploaded_plan.name} · {uploaded_plan.size / (1024 ** 2):,.1f} MB"
+    with st.expander("Columnas que realmente se leen de cada CSV"):
+        st.markdown(
+            """
+            - **Tienda:** `Warehouseid` o `Node_Store` — cualquiera de los dos funciona.
+              Si ambos vienen informados en una fila, deben coincidir.
+            - **Producto:** `SKU ID`.
+            - **Planeación:** `Predicted Demand for selected duration`,
+              `Predicted Opening Inventory`,
+              `Replenishment Quantity for Plan Duration (MOV)` y
+              `Net Inter-Store Transfers`.
+
+            Todos los demás campos del CSV se ignoran. Inventario actual, ciudad,
+            nombre de tienda, storage, valor, volumen y reglas operativas se toman
+            directamente de la base de datos. Cuando una tienda–SKU aparece más de
+            una vez, esas cuatro métricas de planeación se **suman** antes de ejecutar.
+            """
         )
+    if uploaded_plans:
+        total_upload_mb = sum(file.size for file in uploaded_plans) / (1024 ** 2)
+        st.success(
+            f"{len(uploaded_plans):,} archivo(s) listo(s) · "
+            f"{total_upload_mb:,.1f} MB en total"
+        )
+        with st.expander("Ver archivos cargados"):
+            for uploaded_file in uploaded_plans:
+                st.write(
+                    f"{uploaded_file.name} · "
+                    f"{uploaded_file.size / (1024 ** 2):,.1f} MB"
+                )
 
     st.markdown('<span class="section-label">03 — VARIABLES</span>', unsafe_allow_html=True)
     run_date = datetime.now(ZoneInfo("America/Mexico_City")).date()
@@ -4326,10 +4915,10 @@ def main() -> None:
             ),
         )
 
-        avl_left, avl_right = st.columns([2, 1])
+        avl_left, preventive_right = st.columns(2)
         with avl_left:
             include_avl_fill = st.toggle(
-                "Completar tareas disponibles con cobertura AVL",
+                "Cubrir stockouts del catálogo (AVL)",
                 value=False,
                 help=(
                     "Después de cubrir Fountain9, busca productos del catálogo con stock "
@@ -4338,18 +4927,31 @@ def main() -> None:
                     "rackeados y prioridad de orígenes."
                 ),
             )
-        with avl_right:
+        with preventive_right:
+            include_preventive_fill = st.toggle(
+                "Blindar posibles quiebres del catálogo",
+                value=False,
+                help=(
+                    "En una última pasada busca productos del catálogo con inventario "
+                    "positivo, pero menor a 1 DOH o menor a 3 unidades. Solo aplica "
+                    "cuando Fountain9 no generó una recomendación positiva para ese "
+                    "caso y utiliza exclusivamente tareas sobrantes."
+                ),
+            )
+
+        _, doh_column, _ = st.columns([1, 2, 1])
+        with doh_column:
             avl_doh = st.number_input(
-                "DOH para cobertura AVL",
+                "DOH objetivo para coberturas de catálogo",
                 min_value=0.5,
                 max_value=30.0,
                 value=3.0,
                 step=0.5,
-                disabled=not include_avl_fill,
+                disabled=not (include_avl_fill or include_preventive_fill),
                 help=(
-                    "Cantidad objetivo = ADU × DOH, redondeada hacia arriba. "
-                    "Se envían al menos 3 unidades; si el stock permitido no "
-                    "alcanza, se manda lo disponible."
+                    "Para stockout, objetivo = ADU × DOH. Para el blindaje, objetivo "
+                    "adicional = ADU × DOH menos el inventario actual. En ambos se "
+                    "envían al menos 3 unidades, salvo que el stock permitido no alcance."
                 ),
             )
 
@@ -4358,8 +4960,8 @@ def main() -> None:
         )
 
     if submitted:
-        if uploaded_plan is None:
-            st.error("Primero sube el CSV del plan diario.")
+        if not uploaded_plans:
+            st.error("Primero sube al menos un CSV de planeación.")
             st.stop()
         if not selected_origins:
             st.error("Selecciona al menos un warehouse origen.")
@@ -4367,7 +4969,10 @@ def main() -> None:
         try:
             origins = tuple(selected_origins)
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
-                st.write("Guardando el CSV cargado de forma temporal…")
+                st.write(
+                    f"Guardando y consolidando {len(uploaded_plans):,} CSV "
+                    "cargado(s) de forma temporal…"
+                )
                 st.write("Validando la versión actual de la base de datos…")
                 fetch_public_database.clear()
                 database_bytes = fetch_public_database()
@@ -4405,11 +5010,17 @@ def main() -> None:
                 st.write("Calculando demanda, stock, capacidad y tareas…")
                 if include_avl_fill:
                     st.write(
-                        f"Reservando la última pasada para cobertura AVL a "
+                        f"Reservando una pasada para stockouts AVL a "
                         f"{avl_doh:g} DOH…"
                     )
+                if include_preventive_fill:
+                    st.write(
+                        "Reservando la última pasada para inventarios positivos con "
+                        "menos de 1 DOH o menos de 3 unidades, sin recomendación "
+                        "positiva de Fountain9…"
+                    )
                 run = execute_planning(
-                    uploaded_plan=uploaded_plan,
+                    uploaded_plans=uploaded_plans,
                     database_bytes=database_bytes,
                     origins=origins,
                     max_tasks=int(max_tasks),
@@ -4419,6 +5030,7 @@ def main() -> None:
                     include_avl_fill=include_avl_fill,
                     avl_doh=float(avl_doh),
                     block_fruver_811=block_fruver_811,
+                    include_preventive_fill=include_preventive_fill,
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run
