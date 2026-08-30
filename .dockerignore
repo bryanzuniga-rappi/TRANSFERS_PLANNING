@@ -1,0 +1,10 @@
+.git
+.gitignore
+.venv
+__pycache__
+*.pyc
+.streamlit/secrets.toml
+tests
+*.csv
+*.xlsx
+*.zip
