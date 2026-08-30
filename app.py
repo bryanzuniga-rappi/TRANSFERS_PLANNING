@@ -214,18 +214,13 @@ def inject_styles() -> None:
             line-height: 1;
         }
 
-        .source-grid {
-            display: grid;
-            grid-template-columns: repeat(auto-fit, minmax(230px, 1fr));
-            gap: 18px;
-            margin: 0 9px 26px 0;
-        }
-
         .source-card {
-            min-height: 132px;
+            height: 138px;
             border: 3px solid var(--ink);
-            box-shadow: 6px 6px 0 var(--ink);
-            padding: 16px 17px;
+            box-shadow: 5px 5px 0 var(--ink);
+            padding: 14px 15px;
+            margin: 0 5px 18px 0;
+            box-sizing: border-box;
             display: flex;
             flex-direction: column;
             justify-content: space-between;
@@ -236,7 +231,7 @@ def inject_styles() -> None:
 
         .source-card-name {
             font-family: "Archivo Black", sans-serif;
-            font-size: 1.05rem;
+            font-size: .95rem;
             line-height: 1.05;
             overflow-wrap: anywhere;
         }
@@ -244,7 +239,7 @@ def inject_styles() -> None:
         .source-card-meta {
             margin-top: 9px;
             color: #242424;
-            font-size: .76rem;
+            font-size: .68rem;
             font-weight: 800;
         }
 
@@ -252,7 +247,7 @@ def inject_styles() -> None:
             margin-top: 13px;
             border-top: 2px solid var(--ink);
             padding-top: 9px;
-            font-size: .86rem;
+            font-size: .78rem;
             font-weight: 900;
             text-transform: uppercase;
         }
@@ -582,31 +577,25 @@ def render_database_health(health: dict[str, Any]) -> None:
         unsafe_allow_html=True,
     )
 
-    cards: list[str] = []
-    for row in health["rows"]:
-        card_class = "ok" if row["ESTADO"] == "OK" else "error"
-        card_meta = (
-            "ÚLTIMA ACTUALIZACIÓN"
-            if row["TIPO"] == "ALEPH"
-            else "CONEXIÓN IMPORTRANGE"
-        )
-        cards.append(
-            f"""
-            <article class="source-card {card_class}">
-                <div>
-                    <div class="source-card-name">{html.escape(row['HOJA'])}</div>
-                    <div class="source-card-meta">
-                        {card_meta}
-                    </div>
-                </div>
-                <div class="source-card-result">{html.escape(row['DETALLE'])}</div>
-            </article>
-            """
-        )
-    st.markdown(
-        '<div class="source-grid">' + "".join(cards) + "</div>",
-        unsafe_allow_html=True,
-    )
+    rows = health["rows"]
+    for start in range(0, len(rows), 4):
+        columns = st.columns(4)
+        for column, row in zip(columns, rows[start : start + 4]):
+            card_class = "ok" if row["ESTADO"] == "OK" else "error"
+            card_meta = (
+                "ÚLTIMA ACTUALIZACIÓN"
+                if row["TIPO"] == "ALEPH"
+                else "CONEXIÓN IMPORTRANGE"
+            )
+            card_html = (
+                f'<div class="source-card {card_class}">'
+                f'<div><div class="source-card-name">{html.escape(row["HOJA"])}</div>'
+                f'<div class="source-card-meta">{card_meta}</div></div>'
+                f'<div class="source-card-result">{html.escape(row["DETALLE"])}</div>'
+                '</div>'
+            )
+            with column:
+                st.markdown(card_html, unsafe_allow_html=True)
 
     if not online:
         st.error(
