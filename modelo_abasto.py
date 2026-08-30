@@ -883,6 +883,9 @@ def plan_transfers(
                 "CITY_NORMALIZED": city_norm,
                 "WAREHOUSE_NAME": warehouse_name,
                 "PRIORIDAD_TIENDA": catalogs.store_priority.get(destination, 100),
+                "ES_MANUAL_FORECAST_ZERO": bool(
+                    row.get("ES_MANUAL_FORECAST_ZERO", False)
+                ),
                 "ES_GOLDEN_INFALTABLE": is_golden,
                 "ES_STOCKOUT": row["CURRENT_INVENTORY"] <= 0,
                 "M3_POR_UNIDAD": catalogs.volume_m3.get(
@@ -900,6 +903,7 @@ def plan_transfers(
 
     prepared.sort(
         key=lambda row: (
+            0 if not row["ES_MANUAL_FORECAST_ZERO"] else 1,
             0 if row["ES_GOLDEN_INFALTABLE"] else 1,
             row["PRIORIDAD_TIENDA"],
             0 if row["ES_STOCKOUT"] else 1,
