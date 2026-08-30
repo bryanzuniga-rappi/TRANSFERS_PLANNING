@@ -2,18 +2,18 @@ from __future__ import annotations
 
 from collections import Counter
 from contextlib import redirect_stdout
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 import io
-import re
 import shutil
 import tempfile
 import urllib.error
 import urllib.request
 import zipfile
 
+import openpyxl
 import streamlit as st
 
 import modelo_abasto as engine
@@ -22,6 +22,40 @@ import modelo_abasto as engine
 APP_NAME = "Transfer Planner"
 MAX_UPLOAD_MB = 500
 DATA_TRANSFERS_SPREADSHEET_ID = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
+
+ORIGIN_WAREHOUSES = {
+    444: "CITYPARK TURBO",
+    831: "CITYPARK CHEDRAUI",
+    811: "CEDA TURBO",
+    834: "CEDA CHEDRAUI",
+    425: "CEDIS LOCAL GDL",
+    856: "CEDIS - LOCAL MTY",
+    49: "NODO ALTAVISTA",
+}
+
+ALEPH_SHEETS = {
+    "NO_DISPONIBLE",
+    "STOCK",
+    "GOLDEN_INFALTABLES",
+    "TIENDA",
+    "STORAGE",
+}
+
+REQUIRED_DATABASE_SHEETS = (
+    "VOLUMETRIA",
+    "BLOQUEOS",
+    "RUTA_COSTOS",
+    "PRIORIDAD",
+    "HIGH_VALUE",
+    "RACKEADOS",
+    "CAP_RECIBO",
+    "COPERNICO",
+    "NO_DISPONIBLE",
+    "STOCK",
+    "GOLDEN_INFALTABLES",
+    "TIENDA",
+    "STORAGE",
+)
 
 
 st.set_page_config(
@@ -134,6 +168,34 @@ def inject_styles() -> None:
             font-weight: 700;
         }
 
+        .database-status {
+            border: 4px solid var(--ink);
+            box-shadow: 8px 8px 0 var(--ink);
+            padding: 20px 22px;
+            margin: 8px 9px 22px 0;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 18px;
+        }
+
+        .database-status.online { background: var(--acid); }
+        .database-status.review { background: var(--coral); }
+
+        .database-title {
+            font-family: "Archivo Black", sans-serif;
+            font-size: clamp(1.4rem, 3vw, 2.4rem);
+            line-height: 1;
+        }
+
+        .database-detail {
+            border: 3px solid var(--ink);
+            background: var(--white);
+            padding: 7px 11px;
+            font-weight: 900;
+            white-space: nowrap;
+        }
+
         div[data-testid="stFileUploader"] {
             border: 4px dashed var(--ink);
             background: var(--white);
@@ -230,19 +292,85 @@ def inject_styles() -> None:
     )
 
 
-def parse_origins(value: str) -> tuple[int, ...]:
-    tokens = [token for token in re.split(r"[\s,;|]+", value.strip()) if token]
-    if not tokens:
-        raise ValueError("Ingresa al menos un warehouse origen")
+def format_origin(warehouse_id: int) -> str:
+    return f"{warehouse_id} - {ORIGIN_WAREHOUSES[warehouse_id]}"
+
+
+def display_cell_value(value: Any) -> str:
+    if value is None or str(value).strip() == "":
+        return "SIN DATO"
+    if isinstance(value, datetime):
+        return value.strftime("%d-%m-%Y %H:%M:%S")
+    if isinstance(value, date):
+        return value.strftime("%d-%m-%Y")
+    return str(value).strip()
+
+
+def contains_ref_error(value: Any) -> bool:
+    return value is not None and "#REF!" in str(value).upper()
+
+
+def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
+    """Valida presencia de hojas, actualizaciones Aleph y errores IMPORTRANGE."""
+    rows: list[dict[str, Any]] = []
+    formula_workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=False
+    )
+    value_workbook = openpyxl.load_workbook(
+        io.BytesIO(workbook_bytes), read_only=True, data_only=True
+    )
     try:
-        origins = tuple(int(token) for token in tokens)
-    except ValueError as exc:
-        raise ValueError("Los orígenes deben ser IDs enteros separados por comas") from exc
-    if any(origin <= 0 for origin in origins):
-        raise ValueError("Los IDs de origen deben ser positivos")
-    if len(origins) != len(set(origins)):
-        raise ValueError("La lista de orígenes contiene duplicados")
-    return origins
+        for sheet_name in REQUIRED_DATABASE_SHEETS:
+            if sheet_name not in formula_workbook.sheetnames:
+                rows.append(
+                    {
+                        "HOJA": sheet_name,
+                        "TIPO": "ALEPH" if sheet_name in ALEPH_SHEETS else "IMPORTRANGE",
+                        "CONTROL": "C7" if sheet_name in ALEPH_SHEETS else "A1",
+                        "ÚLTIMA ACTUALIZACIÓN / VALIDACIÓN": "HOJA NO ENCONTRADA",
+                        "ESTADO": "ERROR",
+                    }
+                )
+                continue
+
+            formula_sheet = formula_workbook[sheet_name]
+            value_sheet = value_workbook[sheet_name]
+            if sheet_name in ALEPH_SHEETS:
+                value = value_sheet["C7"].value
+                if value is None:
+                    value = formula_sheet["C7"].value
+                healthy = value is not None and str(value).strip() != "" and not contains_ref_error(value)
+                detail = display_cell_value(value)
+            else:
+                formula_value = formula_sheet["A1"].value
+                displayed_value = value_sheet["A1"].value
+                healthy = not (
+                    contains_ref_error(formula_value)
+                    or contains_ref_error(displayed_value)
+                )
+                detail = "SIN #REF!" if healthy else "#REF! DETECTADO"
+
+            rows.append(
+                {
+                    "HOJA": sheet_name,
+                    "TIPO": "ALEPH" if sheet_name in ALEPH_SHEETS else "IMPORTRANGE",
+                    "CONTROL": "C7" if sheet_name in ALEPH_SHEETS else "A1",
+                    "ÚLTIMA ACTUALIZACIÓN / VALIDACIÓN": detail,
+                    "ESTADO": "OK" if healthy else "ERROR",
+                }
+            )
+    finally:
+        formula_workbook.close()
+        value_workbook.close()
+
+    healthy_count = sum(row["ESTADO"] == "OK" for row in rows)
+    return {
+        "online": healthy_count == len(rows),
+        "healthy_count": healthy_count,
+        "total_count": len(rows),
+        "error_count": len(rows) - healthy_count,
+        "rows": rows,
+    }
 
 
 def save_uploaded_file(uploaded_file, destination: Path) -> None:
@@ -253,9 +381,9 @@ def save_uploaded_file(uploaded_file, destination: Path) -> None:
     uploaded_file.seek(0)
 
 
-def download_public_data_transfers(destination: Path) -> None:
-    """Exporta el Google Sheet público completo como XLSX."""
-    destination.parent.mkdir(parents=True, exist_ok=True)
+@st.cache_data(ttl=300, show_spinner=False)
+def fetch_public_database() -> bytes:
+    """Exporta el Google Sheet público completo como XLSX y conserva 5 min de caché."""
     export_url = (
         "https://docs.google.com/spreadsheets/d/"
         f"{DATA_TRANSFERS_SPREADSHEET_ID}/export?format=xlsx"
@@ -266,22 +394,64 @@ def download_public_data_transfers(destination: Path) -> None:
     )
     try:
         with urllib.request.urlopen(request, timeout=300) as response:
-            with destination.open("wb") as handle:
-                shutil.copyfileobj(response, handle, length=8 * 1024 * 1024)
+            workbook_bytes = response.read()
     except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
         raise RuntimeError(
-            "No pude descargar DATA_TRANSFERS. Confirma que el Google Sheet "
+            "No pude consultar la base de datos. Confirma que el Google Sheet "
             "siga configurado como 'Cualquier persona con el enlace: Lector'."
         ) from exc
 
-    if not destination.exists() or destination.stat().st_size == 0:
-        raise RuntimeError("Google devolvió un DATA_TRANSFERS vacío.")
-    if not zipfile.is_zipfile(destination):
-        destination.unlink(missing_ok=True)
+    if not workbook_bytes:
+        raise RuntimeError("Google devolvió una base de datos vacía.")
+    if not zipfile.is_zipfile(io.BytesIO(workbook_bytes)):
         raise RuntimeError(
-            "Google no devolvió un archivo Excel. Revisa que DATA_TRANSFERS "
-            "sea público y que el ID configurado sea correcto."
+            "Google no devolvió un archivo Excel válido. Revisa el acceso público."
         )
+    return workbook_bytes
+
+
+def save_database(workbook_bytes: bytes, destination: Path) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    with destination.open("wb") as handle:
+        handle.write(workbook_bytes)
+
+
+def render_database_health(health: dict[str, Any]) -> None:
+    online = health["online"]
+    css_class = "online" if online else "review"
+    status = "ONLINE" if online else "REVISAR"
+    detail = f"{health['healthy_count']} / {health['total_count']} HOJAS OK"
+    st.markdown(
+        f"""
+        <div class="database-status {css_class}">
+            <div class="database-title">BASE DE DATOS — {status}</div>
+            <div class="database-detail">{detail}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    with st.expander("Ver estado de las fuentes", expanded=not online):
+        st.dataframe(
+            health["rows"],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "HOJA": st.column_config.TextColumn("HOJA", width="medium"),
+                "TIPO": st.column_config.TextColumn("TIPO", width="small"),
+                "CONTROL": st.column_config.TextColumn("CONTROL", width="small"),
+                "ÚLTIMA ACTUALIZACIÓN / VALIDACIÓN": st.column_config.TextColumn(
+                    "ÚLTIMA ACTUALIZACIÓN / VALIDACIÓN", width="large"
+                ),
+                "ESTADO": st.column_config.TextColumn("ESTADO", width="small"),
+            },
+        )
+        if online:
+            st.success("Todas las fuentes requeridas respondieron correctamente.")
+        else:
+            st.error(
+                f"Se detectaron {health['error_count']} hojas con problemas. "
+                "Revísalas antes de ejecutar la planeación."
+            )
 
 
 def create_zip(paths: list[Path], destination: Path) -> Path:
@@ -304,12 +474,10 @@ def clear_previous_workspace() -> None:
 
 def execute_planning(
     uploaded_plan,
+    database_bytes: bytes,
     origins: tuple[int, ...],
     max_tasks: int,
     run_date,
-    default_capacity: float,
-    default_m3: float,
-    minimum_quantity: int,
 ) -> dict[str, Any]:
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
@@ -318,15 +486,15 @@ def execute_planning(
     data_path = workspace / "input" / "DATA_TRANSFERS.xlsx"
 
     save_uploaded_file(uploaded_plan, plan_path)
-    download_public_data_transfers(data_path)
+    save_database(database_bytes, data_path)
 
     config = engine.Config(
         origin_warehouses=origins,
         max_tasks=max_tasks,
         run_date_override=run_date.strftime("%d-%m-%Y"),
-        default_store_capacity_m3=default_capacity,
-        default_m3_per_unit=default_m3,
-        minimum_positive_quantity=minimum_quantity,
+        default_store_capacity_m3=engine.CONFIG.default_store_capacity_m3,
+        default_m3_per_unit=engine.CONFIG.default_m3_per_unit,
+        minimum_positive_quantity=engine.CONFIG.minimum_positive_quantity,
         local_work_dir=str(workspace / "engine"),
         replace_same_day_outputs=True,
         generate_empty_source_files=False,
@@ -424,41 +592,70 @@ def main() -> None:
         <section class="hero">
             <span class="hero-kicker">ABASTO / MX / WEB</span>
             <h1>TRANSFER<br>PLANNER.</h1>
-            <p>Sube el requerimiento diario, define los orígenes y ejecuta el mismo motor sin editar código. DATA_TRANSFERS se consulta automáticamente.</p>
+            <p>Sube el requerimiento diario, define los orígenes y ejecuta el mismo motor sin editar código. La base se consulta y valida automáticamente.</p>
         </section>
         """,
         unsafe_allow_html=True,
     )
 
-    st.markdown('<span class="section-label">01 — ARCHIVOS</span>', unsafe_allow_html=True)
-    st.markdown(
-        '<div class="info-strip">DATA_TRANSFERS conectado automáticamente · Solo carga el CSV diario · Los resultados se procesan temporalmente.</div>',
-        unsafe_allow_html=True,
-    )
+    st.markdown('<span class="section-label">01 — BASE DE DATOS</span>', unsafe_allow_html=True)
+    database_bytes: bytes | None = None
+    database_health: dict[str, Any] | None = None
+    try:
+        with st.spinner("Validando fuentes de información…"):
+            database_bytes = fetch_public_database()
+            database_health = inspect_database(database_bytes)
+        render_database_health(database_health)
+    except Exception as exc:
+        st.markdown(
+            """
+            <div class="database-status review">
+                <div class="database-title">BASE DE DATOS — OFFLINE</div>
+                <div class="database-detail">SIN CONEXIÓN</div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        st.error(f"No fue posible validar la base de datos: {exc}")
+
+    if st.button("VOLVER A VALIDAR LA BASE", use_container_width=False):
+        fetch_public_database.clear()
+        st.rerun()
+
+    st.markdown('<span class="section-label">02 — ARCHIVO DE PLANEACIÓN</span>', unsafe_allow_html=True)
     uploaded_plan = st.file_uploader(
         "Plan diario (.csv)",
         type=["csv"],
         max_upload_size=MAX_UPLOAD_MB,
         help="El archivo debe conservar las columnas originales del plan.",
     )
-    st.success("DATA_TRANSFERS · CONECTADO")
     if uploaded_plan is not None:
         st.success(
             f"{uploaded_plan.name} · {uploaded_plan.size / (1024 ** 2):,.1f} MB"
         )
 
-    st.markdown('<span class="section-label">02 — VARIABLES</span>', unsafe_allow_html=True)
-    today_mx = datetime.now(ZoneInfo("America/Mexico_City")).date()
+    st.markdown('<span class="section-label">03 — VARIABLES</span>', unsafe_allow_html=True)
+    run_date = datetime.now(ZoneInfo("America/Mexico_City")).date()
+    default_origins = [
+        origin
+        for origin in engine.CONFIG.origin_warehouses
+        if origin in ORIGIN_WAREHOUSES
+    ] or [811, 834]
 
     with st.form("planning_config"):
-        left, middle, right = st.columns([1.4, 1, 1])
+        left, right = st.columns([2, 1])
         with left:
-            origins_text = st.text_input(
-                "Warehouses origen — en orden de prioridad",
-                value=", ".join(map(str, engine.CONFIG.origin_warehouses)),
-                help="El motor consumirá stock de izquierda a derecha.",
+            selected_origins = st.multiselect(
+                "Warehouses origen — selecciona en orden de prioridad",
+                options=list(ORIGIN_WAREHOUSES),
+                default=default_origins,
+                format_func=format_origin,
+                help=(
+                    "El motor consumirá stock en el orden seleccionado. Para cambiar "
+                    "la prioridad, elimina las opciones y vuelve a elegirlas."
+                ),
             )
-        with middle:
+        with right:
             max_tasks = st.number_input(
                 "Máximo de tareas",
                 min_value=0,
@@ -466,33 +663,6 @@ def main() -> None:
                 value=int(engine.CONFIG.max_tasks),
                 step=500,
             )
-        with right:
-            run_date = st.date_input("Fecha de ejecución", value=today_mx)
-
-        with st.expander("Configuración avanzada"):
-            adv1, adv2, adv3 = st.columns(3)
-            with adv1:
-                default_capacity = st.number_input(
-                    "Capacidad default por tienda (m³)",
-                    min_value=0.0,
-                    value=float(engine.CONFIG.default_store_capacity_m3),
-                    step=1.0,
-                )
-            with adv2:
-                default_m3 = st.number_input(
-                    "Volumen default por unidad (m³)",
-                    min_value=0.0,
-                    value=float(engine.CONFIG.default_m3_per_unit),
-                    step=0.001,
-                    format="%.6f",
-                )
-            with adv3:
-                minimum_quantity = st.number_input(
-                    "Cantidad mínima positiva",
-                    min_value=1,
-                    value=int(engine.CONFIG.minimum_positive_quantity),
-                    step=1,
-                )
 
         submitted = st.form_submit_button(
             "EJECUTAR PLANEACIÓN →", use_container_width=True
@@ -502,20 +672,29 @@ def main() -> None:
         if uploaded_plan is None:
             st.error("Primero sube el CSV del plan diario.")
             st.stop()
+        if not selected_origins:
+            st.error("Selecciona al menos un warehouse origen.")
+            st.stop()
         try:
-            origins = parse_origins(origins_text)
+            origins = tuple(selected_origins)
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
                 st.write("Guardando el CSV cargado de forma temporal…")
-                st.write("Descargando la versión actual de DATA_TRANSFERS…")
+                st.write("Validando la versión actual de la base de datos…")
+                fetch_public_database.clear()
+                database_bytes = fetch_public_database()
+                database_health = inspect_database(database_bytes)
+                if not database_health["online"]:
+                    raise RuntimeError(
+                        "La base de datos tiene una o más fuentes con error. "
+                        "Abre el panel de estado y corrige las hojas indicadas."
+                    )
                 st.write("Calculando demanda, stock, capacidad y tareas…")
                 run = execute_planning(
                     uploaded_plan=uploaded_plan,
+                    database_bytes=database_bytes,
                     origins=origins,
                     max_tasks=int(max_tasks),
                     run_date=run_date,
-                    default_capacity=float(default_capacity),
-                    default_m3=float(default_m3),
-                    minimum_quantity=int(minimum_quantity),
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run
@@ -523,7 +702,7 @@ def main() -> None:
             st.session_state.pop("last_run", None)
             st.error(f"No se pudo completar la planeación: {exc}")
             st.info(
-                "Revisa el CSV, el acceso público de DATA_TRANSFERS y que los warehouses origen existan en TIENDA."
+                "Revisa el CSV, el panel de estado y que los warehouses origen existan en TIENDA."
             )
 
     last_run = st.session_state.get("last_run")
