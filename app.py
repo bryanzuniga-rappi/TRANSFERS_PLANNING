@@ -174,7 +174,6 @@ BREAKDOWN_ORDER = (
     "CORTE POR STOCK",
     "OK MANUAL POR FORECAST 0",
     "OK MANUAL PARCIAL POR CUPO DE TAREAS",
-    "MANUAL NO EJECUTADO POR CUPO DE TAREAS",
     "OK COMPLETO POR FOUNTAIN9",
     "OK PARCIAL - CORTE POR PRODUCTO RACKEADO 444",
     "OK PARCIAL - CORTE POR STOCK",
@@ -1206,6 +1205,20 @@ def attach_consolidated_input_to_result(
             allocation[PLANNING_REASON_COLUMN] = (
                 PLANNING_REASON_MANUAL_FORECAST_ZERO
             )
+
+
+def omit_unexecuted_manual_task_rows(result) -> None:
+    """Omite manualidades sin asignación cuando se agotó el cupo de tareas."""
+    result.base_rows[:] = [
+        row
+        for row in result.base_rows
+        if not (
+            row.get("REGLA_DEMANDA") in MANUAL_FORECAST_ZERO_RULES
+            and int(row.get("CANTIDAD_ASIGNADA", 0) or 0) <= 0
+            and row.get("TIPO_DE_CORTE")
+            == "CORTE POR CAPACIDAD DE TAREAS"
+        )
+    ]
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -2309,13 +2322,6 @@ def apply_reporting_labels(result) -> None:
                 "OK MANUAL POR FORECAST 0"
                 if demand_rule in MANUAL_FORECAST_ZERO_RULES
                 else "OK COMPLETO POR FOUNTAIN9"
-            )
-        elif (
-            current_cut == "CORTE POR CAPACIDAD DE TAREAS"
-            and demand_rule in MANUAL_FORECAST_ZERO_RULES
-        ):
-            row["TIPO_DE_CORTE"] = (
-                "MANUAL NO EJECUTADO POR CUPO DE TAREAS"
             )
         elif (
             current_cut == "OK PARCIAL - CORTE POR CAPACIDAD DE TAREAS"
@@ -3798,6 +3804,7 @@ def execute_planning(
             )
 
         attach_consolidated_input_to_result(result, consolidated_input)
+        omit_unexecuted_manual_task_rows(result)
         normalize_result_storage(result)
         analytics = build_planning_analytics(result, origins)
         apply_reporting_labels(result)
