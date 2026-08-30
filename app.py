@@ -10,6 +10,8 @@ import io
 import re
 import shutil
 import tempfile
+import urllib.error
+import urllib.request
 import zipfile
 
 import streamlit as st
@@ -19,6 +21,7 @@ import modelo_abasto as engine
 
 APP_NAME = "Transfer Planner"
 MAX_UPLOAD_MB = 500
+DATA_TRANSFERS_SPREADSHEET_ID = "18kHevkMvf9l4s6ANg3h5KdNyj2yEPGAp5C_t8JwxFVw"
 
 
 st.set_page_config(
@@ -250,6 +253,37 @@ def save_uploaded_file(uploaded_file, destination: Path) -> None:
     uploaded_file.seek(0)
 
 
+def download_public_data_transfers(destination: Path) -> None:
+    """Exporta el Google Sheet público completo como XLSX."""
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    export_url = (
+        "https://docs.google.com/spreadsheets/d/"
+        f"{DATA_TRANSFERS_SPREADSHEET_ID}/export?format=xlsx"
+    )
+    request = urllib.request.Request(
+        export_url,
+        headers={"User-Agent": "Mozilla/5.0 TransferPlanner/1.0"},
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=300) as response:
+            with destination.open("wb") as handle:
+                shutil.copyfileobj(response, handle, length=8 * 1024 * 1024)
+    except (urllib.error.HTTPError, urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(
+            "No pude descargar DATA_TRANSFERS. Confirma que el Google Sheet "
+            "siga configurado como 'Cualquier persona con el enlace: Lector'."
+        ) from exc
+
+    if not destination.exists() or destination.stat().st_size == 0:
+        raise RuntimeError("Google devolvió un DATA_TRANSFERS vacío.")
+    if not zipfile.is_zipfile(destination):
+        destination.unlink(missing_ok=True)
+        raise RuntimeError(
+            "Google no devolvió un archivo Excel. Revisa que DATA_TRANSFERS "
+            "sea público y que el ID configurado sea correcto."
+        )
+
+
 def create_zip(paths: list[Path], destination: Path) -> Path:
     with zipfile.ZipFile(destination, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         for path in paths:
@@ -270,7 +304,6 @@ def clear_previous_workspace() -> None:
 
 def execute_planning(
     uploaded_plan,
-    uploaded_catalog,
     origins: tuple[int, ...],
     max_tasks: int,
     run_date,
@@ -285,7 +318,7 @@ def execute_planning(
     data_path = workspace / "input" / "DATA_TRANSFERS.xlsx"
 
     save_uploaded_file(uploaded_plan, plan_path)
-    save_uploaded_file(uploaded_catalog, data_path)
+    download_public_data_transfers(data_path)
 
     config = engine.Config(
         origin_warehouses=origins,
@@ -391,7 +424,7 @@ def main() -> None:
         <section class="hero">
             <span class="hero-kicker">ABASTO / MX / WEB</span>
             <h1>TRANSFER<br>PLANNER.</h1>
-            <p>Sube DATA_TRANSFERS y el requerimiento diario, define los orígenes y ejecuta el mismo motor sin editar código.</p>
+            <p>Sube el requerimiento diario, define los orígenes y ejecuta el mismo motor sin editar código. DATA_TRANSFERS se consulta automáticamente.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -399,28 +432,16 @@ def main() -> None:
 
     st.markdown('<span class="section-label">01 — ARCHIVOS</span>', unsafe_allow_html=True)
     st.markdown(
-        '<div class="info-strip">Todo se procesa temporalmente · No usa Google APIs · No guarda archivos en Drive.</div>',
+        '<div class="info-strip">DATA_TRANSFERS conectado automáticamente · Solo carga el CSV diario · Los resultados se procesan temporalmente.</div>',
         unsafe_allow_html=True,
     )
-    file_left, file_right = st.columns(2)
-    with file_left:
-        uploaded_catalog = st.file_uploader(
-            "DATA_TRANSFERS.xlsx",
-            type=["xlsx"],
-            max_upload_size=MAX_UPLOAD_MB,
-            help="Descarga el Google Sheet como Microsoft Excel (.xlsx).",
-        )
-    with file_right:
-        uploaded_plan = st.file_uploader(
-            "Plan diario (.csv)",
-            type=["csv"],
-            max_upload_size=MAX_UPLOAD_MB,
-            help="El archivo debe conservar las columnas originales del plan.",
-        )
-    if uploaded_catalog is not None:
-        st.success(
-            f"{uploaded_catalog.name} · {uploaded_catalog.size / (1024 ** 2):,.1f} MB"
-        )
+    uploaded_plan = st.file_uploader(
+        "Plan diario (.csv)",
+        type=["csv"],
+        max_upload_size=MAX_UPLOAD_MB,
+        help="El archivo debe conservar las columnas originales del plan.",
+    )
+    st.success("DATA_TRANSFERS · CONECTADO")
     if uploaded_plan is not None:
         st.success(
             f"{uploaded_plan.name} · {uploaded_plan.size / (1024 ** 2):,.1f} MB"
@@ -481,18 +502,14 @@ def main() -> None:
         if uploaded_plan is None:
             st.error("Primero sube el CSV del plan diario.")
             st.stop()
-        if uploaded_catalog is None:
-            st.error("Primero sube DATA_TRANSFERS.xlsx.")
-            st.stop()
         try:
             origins = parse_origins(origins_text)
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
                 st.write("Guardando el CSV cargado de forma temporal…")
-                st.write("Preparando DATA_TRANSFERS…")
+                st.write("Descargando la versión actual de DATA_TRANSFERS…")
                 st.write("Calculando demanda, stock, capacidad y tareas…")
                 run = execute_planning(
                     uploaded_plan=uploaded_plan,
-                    uploaded_catalog=uploaded_catalog,
                     origins=origins,
                     max_tasks=int(max_tasks),
                     run_date=run_date,
@@ -506,7 +523,7 @@ def main() -> None:
             st.session_state.pop("last_run", None)
             st.error(f"No se pudo completar la planeación: {exc}")
             st.info(
-                "Revisa el formato de ambos archivos y que los warehouses origen existan en TIENDA."
+                "Revisa el CSV, el acceso público de DATA_TRANSFERS y que los warehouses origen existan en TIENDA."
             )
 
     last_run = st.session_state.get("last_run")
