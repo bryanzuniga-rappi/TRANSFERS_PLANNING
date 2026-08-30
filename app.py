@@ -207,6 +207,12 @@ INSUMOS_COLUMNS = [
     "DELIVERY_PRIORITY",
 ]
 
+INSUMO_STOCK_RULES = {
+    85097: {"name": "BOLSA 1", "target_stock": 7_000, "moq": 1_000},
+    86195: {"name": "BOLSA 2", "target_stock": 2_100, "moq": 350},
+    76491: {"name": "STICKER", "target_stock": 10_000, "moq": 1_000},
+}
+
 CITY_DISPLAY_NAMES = {
     "CDMX": "Ciudad de México",
     "GDL": "Guadalajara",
@@ -1365,19 +1371,27 @@ def load_insumos_rows(
 def append_insumos_to_bulk_444(
     local_files: list[Path],
     result,
+    catalogs,
     insumos_rows: list[dict[str, Any]],
     origins: tuple[int, ...],
     include_insumos: bool,
 ) -> dict[str, Any]:
-    """Anexa insumos sin modificar stock, capacidad ni el contador de tareas."""
+    """Anexa insumos limitados por stock ajustado del 444 y por su MOQ."""
     summary = {
         "requested": include_insumos,
         "enabled": include_insumos and 444 in origins,
         "source_rows": len(insumos_rows),
         "eligible_stores": 0,
+        "requested_units": 0,
         "lines_added": 0,
         "units_added": 0,
         "stores_added": 0,
+        "units_cut_stock": 0,
+        "units_cut_moq": 0,
+        "lines_reduced": 0,
+        "lines_removed": 0,
+        "products_cut_stock": 0,
+        "stock_detail": [],
     }
     if not summary["enabled"]:
         return summary
@@ -1391,12 +1405,136 @@ def append_insumos_to_bulk_444(
         row["WAREHOUSE_DESTINATION"] for row in regular_444_rows
     }
     summary["eligible_stores"] = len(eligible_destinations)
-    selected = [
+    selected_requested = [
         row
         for row in insumos_rows
         if row["WAREHOUSE_DESTINATION"] in eligible_destinations
     ]
+    if not selected_requested:
+        return summary
+
+    summary["requested_units"] = sum(
+        int(row["QUANTITY"]) for row in selected_requested
+    )
+
+    consumed_by_normal_plan: Counter[int] = Counter()
+    for allocation in result.allocation_rows:
+        if int(allocation["WAREHOUSE_SOURCE"]) == 444:
+            consumed_by_normal_plan[int(allocation["RETAIL_ID"])] += int(
+                allocation["QUANTITY"]
+            )
+
+    selected_by_sku: dict[int, list[tuple[int, dict[str, Any]]]] = defaultdict(list)
+    for input_order, row in enumerate(selected_requested):
+        selected_by_sku[int(row["RETAIL_ID"])].append((input_order, row))
+
+    final_quantities: dict[int, int] = {}
+    for sku, indexed_rows in selected_by_sku.items():
+        rule = INSUMO_STOCK_RULES.get(sku)
+        if rule is None:
+            rule = {"name": f"INSUMO {sku}", "target_stock": 0, "moq": 1}
+            result.warnings.append(
+                f"INSUMOS: PRODUCT_ID {sku} no tiene MOQ configurado; se aplicó "
+                "MOQ 1 para respetar el stock del warehouse 444."
+            )
+        moq = int(rule["moq"])
+        stock_components = engine.source_stock_components(catalogs, 444, sku)
+        adjusted_stock = int(stock_components["adjusted"])
+        consumed_units = int(consumed_by_normal_plan.get(sku, 0))
+        available_stock = max(adjusted_stock - consumed_units, 0)
+        available_batches = available_stock // moq
+
+        prepared_rows: list[dict[str, Any]] = []
+        requested_rounded_units = 0
+        moq_cut_units = 0
+        for input_order, row in indexed_rows:
+            requested_quantity = int(row["QUANTITY"])
+            requested_batches = requested_quantity // moq
+            rounded_quantity = requested_batches * moq
+            requested_rounded_units += rounded_quantity
+            moq_cut_units += requested_quantity - rounded_quantity
+            prepared_rows.append(
+                {
+                    "input_order": input_order,
+                    "row": row,
+                    "requested_quantity": requested_quantity,
+                    "requested_batches": requested_batches,
+                    "priority": catalogs.store_priority.get(
+                        int(row["WAREHOUSE_DESTINATION"]),
+                        100,
+                    ),
+                }
+            )
+
+        prepared_rows.sort(
+            key=lambda item: (
+                item["priority"],
+                int(item["row"]["WAREHOUSE_DESTINATION"]),
+                item["input_order"],
+            )
+        )
+        shipped_units = 0
+        for item in prepared_rows:
+            allocated_batches = min(item["requested_batches"], available_batches)
+            final_quantity = allocated_batches * moq
+            available_batches -= allocated_batches
+            final_quantities[item["input_order"]] = final_quantity
+            shipped_units += final_quantity
+            if final_quantity < item["requested_quantity"]:
+                summary["lines_reduced"] += 1
+            if final_quantity <= 0:
+                summary["lines_removed"] += 1
+
+        stock_cut_units = max(requested_rounded_units - shipped_units, 0)
+        summary["units_cut_stock"] += stock_cut_units
+        summary["units_cut_moq"] += moq_cut_units
+        summary["products_cut_stock"] += int(stock_cut_units > 0)
+        summary["stock_detail"].append(
+            {
+                "PRODUCT_ID": sku,
+                "INSUMO": rule["name"],
+                "TARGET_STOCK": int(rule["target_stock"]),
+                "MOQ": moq,
+                "STOCK_AJUSTADO_444": adjusted_stock,
+                "CONSUMIDO_PLAN_NORMAL": consumed_units,
+                "STOCK_DISPONIBLE_INSUMOS": available_stock,
+                "SOLICITADO": sum(
+                    int(item["requested_quantity"]) for item in prepared_rows
+                ),
+                "ENVIADO": shipped_units,
+                "RECORTE_STOCK": stock_cut_units,
+                "SOBRANTE_NO_UTILIZABLE": max(
+                    available_stock - shipped_units,
+                    0,
+                ),
+            }
+        )
+
+        if stock_cut_units > 0:
+            result.warnings.append(
+                f"INSUMOS {sku} ({rule['name']}): se solicitaron "
+                f"{sum(int(item['requested_quantity']) for item in prepared_rows):,} "
+                f"unidades y se enviaron {shipped_units:,}; se recortaron "
+                f"{stock_cut_units:,} por stock del 444, respetando MOQ {moq:,}."
+            )
+        if moq_cut_units > 0:
+            result.warnings.append(
+                f"INSUMOS {sku} ({rule['name']}): se recortaron "
+                f"{moq_cut_units:,} unidades adicionales porque las cantidades de "
+                f"Aleph no eran múltiplos completos del MOQ {moq:,}."
+            )
+
+    selected: list[dict[str, Any]] = []
+    for input_order, row in enumerate(selected_requested):
+        final_quantity = final_quantities.get(input_order, 0)
+        if final_quantity <= 0:
+            continue
+        adjusted_row = dict(row)
+        adjusted_row["QUANTITY"] = final_quantity
+        selected.append(adjusted_row)
+
     if not selected:
+        summary["stock_detail"].sort(key=lambda row: row["PRODUCT_ID"])
         return summary
 
     bulk_path = next(
@@ -1422,6 +1560,7 @@ def append_insumos_to_bulk_444(
             ),
         }
     )
+    summary["stock_detail"].sort(key=lambda row: row["PRODUCT_ID"])
     return summary
 
 
@@ -3128,7 +3267,9 @@ def write_executive_pdf(
                 f"{closed_stores.get('requirements', 0):,} casos por tienda cerrada; "
                 f"{city_block.get('requirements', 0):,} por ciudad bloqueada; "
                 f"{insumos.get('lines_added', 0):,} líneas y "
-                f"{insumos.get('units_added', 0):,} unidades de insumos. "
+                f"{insumos.get('units_added', 0):,} unidades de insumos; "
+                f"{insumos.get('units_cut_stock', 0):,} unidades recortadas por "
+                "stock del 444. "
                 + (
                     f"FRUVER 811 bloqueado: "
                     f"{fruver_811.get('products_with_stock_blocked', 0):,} productos."
@@ -3619,6 +3760,7 @@ def execute_planning(
         insumos_summary = append_insumos_to_bulk_444(
             local_files,
             result,
+            catalogs,
             insumos_rows,
             origins,
             include_insumos,
@@ -3694,6 +3836,11 @@ def execute_planning(
                 f"{insumos_summary['lines_added']:,} líneas / "
                 f"{insumos_summary['units_added']:,} unidades / "
                 f"{insumos_summary['stores_added']:,} tiendas"
+            )
+            print(
+                "Insumos recortados: "
+                f"{insumos_summary['units_cut_stock']:,} unidades por stock / "
+                f"{insumos_summary['units_cut_moq']:,} unidades por MOQ"
             )
 
     zip_path = create_zip(
@@ -4546,7 +4693,8 @@ def render_results(run: dict[str, Any]) -> None:
                 "value": f"{run.get('insumos', {}).get('lines_added', 0):,}",
                 "description": (
                     "Filas de INSUMOS anexadas al BulkCD_444 para tiendas que ya "
-                    "reciben producto normal desde 444. No consumen tareas."
+                    "reciben producto normal desde 444. No consumen tareas, pero "
+                    "sí están limitadas por stock ajustado y MOQ."
                 ),
             },
             {
@@ -4555,7 +4703,8 @@ def render_results(run: dict[str, Any]) -> None:
                 "value": f"{run.get('insumos', {}).get('units_added', 0):,}",
                 "description": (
                     "Suma de QUANTITY de las líneas de insumos agregadas. Se muestra "
-                    "separada para no mezclarla con unidades de producto."
+                    "separada para no mezclarla con unidades de producto y ya refleja "
+                    "cualquier recorte por stock del 444."
                 ),
                 "tone": "coral",
             },
@@ -4741,6 +4890,42 @@ def render_results(run: dict[str, Any]) -> None:
             f"{insumos['units_added']:,} unidades y "
             f"{insumos['stores_added']:,} tiendas. No consumen tareas del modelo."
         )
+    if insumos.get("units_cut_stock", 0) > 0 or insumos.get("units_cut_moq", 0) > 0:
+        st.warning(
+            "Recorte de insumos aplicado: "
+            f"{insumos.get('requested_units', 0):,} unidades solicitadas, "
+            f"{insumos.get('units_added', 0):,} enviadas, "
+            f"{insumos.get('units_cut_stock', 0):,} recortadas por stock del 444 y "
+            f"{insumos.get('units_cut_moq', 0):,} por ajuste a múltiplos de MOQ."
+        )
+    if insumos.get("stock_detail"):
+        with st.expander("Ver stock y recorte por insumo"):
+            compact_insumo_stock = [
+                {
+                    "PRODUCT_ID": row["PRODUCT_ID"],
+                    "INSUMO": row["INSUMO"],
+                    "TARGET_STOCK": row["TARGET_STOCK"],
+                    "MOQ": row["MOQ"],
+                    "STOCK_DISPONIBLE_444": row["STOCK_DISPONIBLE_INSUMOS"],
+                    "SOLICITADO": row["SOLICITADO"],
+                    "ENVIADO": row["ENVIADO"],
+                    "RECORTE_STOCK": row["RECORTE_STOCK"],
+                }
+                for row in insumos["stock_detail"]
+            ]
+            report_table(
+                compact_insumo_stock,
+                column_config={
+                    "PRODUCT_ID": st.column_config.NumberColumn(
+                        "PRODUCT ID", format="%d"
+                    ),
+                    "TARGET_STOCK": st.column_config.NumberColumn(
+                        "TARGET STOCK", format="%d"
+                    ),
+                    "MOQ": st.column_config.NumberColumn("MOQ", format="%d"),
+                },
+                max_height=280,
+            )
 
     closed_stores = run.get("closed_stores", {})
     if closed_stores.get("requirements", 0) > 0:
@@ -4797,7 +4982,14 @@ def render_results(run: dict[str, Any]) -> None:
 
     st.markdown('<span class="section-label">BREAKDOWN</span>', unsafe_allow_html=True)
     breakdown = ordered_breakdown_rows(run["status_counts"])
-    st.dataframe(breakdown, use_container_width=True, hide_index=True)
+    visible_breakdown_rows = max(12, len(breakdown))
+    breakdown_height = (visible_breakdown_rows + 1) * 36 + 4
+    st.dataframe(
+        breakdown,
+        use_container_width=True,
+        hide_index=True,
+        height=breakdown_height,
+    )
 
     if run.get("analytics"):
         render_planning_analytics(run["analytics"])
@@ -4945,7 +5137,8 @@ def main() -> None:
             help=(
                 "Cuando está activo, anexa los insumos de Aleph únicamente a las "
                 "tiendas que ya reciben producto normal desde el warehouse 444. "
-                "Los insumos no consumen tareas, stock ni capacidad."
+                "No consumen tareas ni capacidad; el envío se limita por el stock "
+                "ajustado del 444 y se recorta en múltiplos de MOQ."
             ),
         )
 
