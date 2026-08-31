@@ -157,7 +157,7 @@ DEMAND_RULE_LABELS = {
     "SIN_DEMANDA": "SIN RECOMENDACIÓN",
     "AVL_DOH": "COBERTURA AVL POR DOH",
     "PREVENTIVO_DOH": "BLINDAJE PREVENTIVO POR DOH",
-    "HARDCODE_3_NET_TRANSFER_BAJO": "NET TRANSFER BAJO · FORZADO A 3",
+    "HARDCODE_3_NET_TRANSFER_BAJO": "NET TRANSFER BAJO · FORZADO AL MÍNIMO",
 }
 
 MANUAL_FORECAST_ZERO_RULES = frozenset(
@@ -679,7 +679,6 @@ def render_kpi_cards(
     *,
     columns_count: int = 4,
 ) -> None:
-    """Renderiza KPIs brutalistas con definición visible tras 1 s de hover."""
     if not cards:
         return
     for start in range(0, len(cards), columns_count):
@@ -810,7 +809,6 @@ def relative_update_text(
 
 
 def inspect_database(workbook_bytes: bytes) -> dict[str, Any]:
-    """Valida presencia de hojas, actualizaciones Aleph y errores IMPORTRANGE."""
     rows: list[dict[str, Any]] = []
     formula_workbook = openpyxl.load_workbook(
         io.BytesIO(workbook_bytes), read_only=True, data_only=False
@@ -934,8 +932,8 @@ def consolidate_plan_files(
     catalogs,
     config: engine.Config,
     output_path: Path,
+    global_min_operative: int = 3,
 ) -> tuple[Path, dict[tuple[int, int], dict[str, Any]], dict[str, Any]]:
-    """Suma archivos y produce el CSV canónico que consume el motor."""
     if not plan_paths:
         raise ValueError("Debes cargar al menos un archivo de planeación.")
 
@@ -1087,13 +1085,13 @@ def consolidate_plan_files(
         deficit_rule = opening < demand
         net_transfer_rule = (
             roq_input <= 0
-            and net_transfer <= 3
-            and destination_stock < 3
+            and net_transfer <= global_min_operative
+            and destination_stock < global_min_operative
             and not zero_total_rule
             and not deficit_rule
         )
         record["NET_TRANSFER_HARDCODE_3"] = net_transfer_rule
-        effective_roq = 3.0 if net_transfer_rule else roq_input
+        effective_roq = float(global_min_operative) if net_transfer_rule else roq_input
         net_transfer_hardcodes += int(net_transfer_rule)
         output_rows.append(
             {
@@ -1141,7 +1139,6 @@ def enrich_consolidated_plan_read(
     consolidated: dict[tuple[int, int], dict[str, Any]],
     consolidation_summary: dict[str, Any],
 ) -> None:
-    """Restaura trazabilidad y métricas originales después de normalizar el CSV."""
     for row in plan_read.rows:
         key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
         source = consolidated[key]
@@ -1170,7 +1167,6 @@ def attach_consolidated_input_to_result(
     result,
     consolidated: dict[tuple[int, int], dict[str, Any]],
 ) -> None:
-    """Agrega al reporte Net Transfers y conserva el ROQ realmente recibido."""
     for row in result.base_rows:
         key = (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"])
         source = consolidated.get(key)
@@ -1208,7 +1204,6 @@ def attach_consolidated_input_to_result(
 
 
 def omit_unexecuted_manual_task_rows(result) -> None:
-    """Omite manualidades sin asignación cuando se agotó el cupo de tareas."""
     result.base_rows[:] = [
         row
         for row in result.base_rows
@@ -1223,7 +1218,6 @@ def omit_unexecuted_manual_task_rows(result) -> None:
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_public_database() -> bytes:
-    """Exporta el Google Sheet público completo como XLSX y conserva 5 min de caché."""
     export_url = (
         "https://docs.google.com/spreadsheets/d/"
         f"{DATA_TRANSFERS_SPREADSHEET_ID}/export?format=xlsx"
@@ -1257,7 +1251,6 @@ def save_database(workbook_bytes: bytes, destination: Path) -> None:
 
 
 def load_closed_store_ids(database_path: Path) -> set[int]:
-    """Carga el bloqueo permanente de tiendas definido en DATA_TRANSFERS."""
     closed_stores: set[int] = set()
     workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
     try:
@@ -1282,7 +1275,6 @@ def load_closed_store_ids(database_path: Path) -> set[int]:
 def load_avl_catalog_rows(
     database_path: Path,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Carga todo el catálogo y consolida una ADU por combinación tienda-SKU."""
     consolidated: dict[tuple[int, int], float] = {}
     warnings: list[str] = []
     workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
@@ -1337,7 +1329,6 @@ def load_insumos_rows(
     database_path: Path,
     catalogs,
 ) -> tuple[list[dict[str, Any]], list[str]]:
-    """Lee INSUMOS tal como lo entrega Aleph; no recalcula sus cantidades."""
     rows: list[dict[str, Any]] = []
     warnings: list[str] = []
     workbook = openpyxl.load_workbook(database_path, read_only=True, data_only=True)
@@ -1420,7 +1411,6 @@ def append_insumos_to_bulk_444(
     origins: tuple[int, ...],
     include_insumos: bool,
 ) -> dict[str, Any]:
-    """Anexa insumos limitados por stock ajustado del 444 y por su MOQ."""
     summary = {
         "requested": include_insumos,
         "enabled": include_insumos and 444 in origins,
@@ -1612,7 +1602,6 @@ def rewrite_bulk_csvs_with_planning_reason(
     local_files: list[Path],
     result,
 ) -> None:
-    """Agrega el origen de planeación únicamente a los CSV operativos Bulk."""
     rows_by_source: dict[int, list[dict[str, Any]]] = defaultdict(list)
     for row in result.allocation_rows:
         rows_by_source[int(row["WAREHOUSE_SOURCE"])].append(row)
@@ -1732,7 +1721,6 @@ def is_fruver_storage(value: Any) -> bool:
 
 
 def normalize_result_storage(result) -> None:
-    """Garantiza una clasificación operativa en reportes y archivos Bulk."""
     for row in result.base_rows:
         row["STORAGE"] = resolved_storage(row.get("STORAGE"))
     for row in result.allocation_rows:
@@ -1744,7 +1732,6 @@ def apply_fruver_811_block(
     origins: tuple[int, ...],
     requested: bool,
 ) -> dict[str, Any]:
-    """Vuelve no elegible el stock FRUVER del origen 811 antes de planear."""
     summary = {
         "requested": requested,
         "enabled": requested and 811 in origins,
@@ -1782,27 +1769,28 @@ def apply_fruver_811_block(
 def build_planning_analytics(
     result,
     configured_origins: tuple[int, ...] = (),
+    global_min_operative: int = 3,
 ) -> dict[str, Any]:
     base_rows = result.base_rows
     allocation_rows = result.allocation_rows
 
     def original_roq_units(row: dict[str, Any]) -> int:
-        return max(int(math.ceil(max(float(row["MOV_ORIGINAL"]), 0.0))), 0)
+        return max(int(math.ceil(max(float(row.get("MOV_ORIGINAL", 0) or 0), 0.0))), 0)
 
-    eligible_rows = [row for row in base_rows if row["CANTIDAD_OBJETIVO"] > 0]
-    assigned_rows = [row for row in eligible_rows if row["CANTIDAD_ASIGNADA"] > 0]
+    eligible_rows = [row for row in base_rows if row.get("CANTIDAD_OBJETIVO", 0) > 0]
+    assigned_rows = [row for row in eligible_rows if row.get("CANTIDAD_ASIGNADA", 0) > 0]
     fully_covered_rows = [
         row
         for row in eligible_rows
-        if row["CANTIDAD_ASIGNADA"] >= row["CANTIDAD_OBJETIVO"]
+        if row.get("CANTIDAD_ASIGNADA", 0) >= row.get("CANTIDAD_OBJETIVO", 0)
     ]
     partially_covered_rows = [
         row
         for row in eligible_rows
-        if 0 < row["CANTIDAD_ASIGNADA"] < row["CANTIDAD_OBJETIVO"]
+        if 0 < row.get("CANTIDAD_ASIGNADA", 0) < row.get("CANTIDAD_OBJETIVO", 0)
     ]
     not_assigned_rows = [
-        row for row in eligible_rows if row["CANTIDAD_ASIGNADA"] <= 0
+        row for row in eligible_rows if row.get("CANTIDAD_ASIGNADA", 0) <= 0
     ]
 
     city_accumulators: dict[str, dict[str, Any]] = defaultdict(
@@ -1868,34 +1856,34 @@ def build_planning_analytics(
     stockout_rows = [
         row for row in eligible_rows if bool(row.get("ES_STOCKOUT", False))
     ]
-    stockout_served = [row for row in stockout_rows if row["CANTIDAD_ASIGNADA"] > 0]
+    stockout_served = [row for row in stockout_rows if row.get("CANTIDAD_ASIGNADA", 0) > 0]
     stockout_fully_covered = [
         row
         for row in stockout_rows
-        if row["CANTIDAD_ASIGNADA"] >= row["CANTIDAD_OBJETIVO"]
+        if row.get("CANTIDAD_ASIGNADA", 0) >= row.get("CANTIDAD_OBJETIVO", 0)
     ]
     forecast_zero_forced = [
         row
         for row in eligible_rows
-        if row["REGLA_DEMANDA"] == "HARDCODE_4_CERO_TOTAL"
+        if row.get("REGLA_DEMANDA") == "HARDCODE_4_CERO_TOTAL"
     ]
     forecast_zero_served = [
-        row for row in forecast_zero_forced if row["CANTIDAD_ASIGNADA"] > 0
+        row for row in forecast_zero_forced if row.get("CANTIDAD_ASIGNADA", 0) > 0
     ]
     deficit_forced = [
         row
         for row in eligible_rows
-        if row["REGLA_DEMANDA"] == "HARDCODE_3_INVENTARIO_MENOR_DEMANDA"
+        if row.get("REGLA_DEMANDA") == "HARDCODE_3_INVENTARIO_MENOR_DEMANDA"
     ]
     net_transfer_forced = [
         row
         for row in eligible_rows
-        if row["REGLA_DEMANDA"] == "HARDCODE_3_NET_TRANSFER_BAJO"
+        if row.get("REGLA_DEMANDA") == "HARDCODE_3_NET_TRANSFER_BAJO"
     ]
     minimum_three_applied = [
         row
         for row in eligible_rows
-        if 0 < row["MOV_ORIGINAL"] < 3 and row["CANTIDAD_OBJETIVO"] == 3
+        if 0 < row.get("MOV_ORIGINAL", 0) < global_min_operative and row.get("CANTIDAD_OBJETIVO", 0) == global_min_operative
     ]
     golden_rows = [
         row for row in eligible_rows if bool(row.get("ES_GOLDEN_INFALTABLE", False))
@@ -1914,10 +1902,10 @@ def build_planning_analytics(
         }
     )
     for row in base_rows:
-        rule = row["REGLA_DEMANDA"]
+        rule = row.get("REGLA_DEMANDA", "")
         data = rule_accumulators[rule]
-        target = int(row["CANTIDAD_OBJETIVO"])
-        assigned = int(row["CANTIDAD_ASIGNADA"])
+        target = int(row.get("CANTIDAD_OBJETIVO", 0))
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0))
         original_roq = original_roq_units(row)
         hardcode_target = max(target - original_roq, 0)
         hardcode_assigned = max(assigned - original_roq, 0)
@@ -1968,13 +1956,13 @@ def build_planning_analytics(
     for row in stockout_rows:
         city = row.get("CITY") or "SIN CIUDAD"
         data = stockout_city_accumulators[city]
-        assigned = int(row["CANTIDAD_ASIGNADA"])
+        assigned = int(row.get("CANTIDAD_ASIGNADA", 0))
         data["cases"] += 1
         if assigned > 0:
             data["served"] += 1
             data["products"].add(row["RETAIL_ID"])
             data["units"] += assigned
-        if assigned >= row["CANTIDAD_OBJETIVO"]:
+        if assigned >= row.get("CANTIDAD_OBJETIVO", 0):
             data["full"] += 1
 
     stockout_city_rows = [
@@ -1991,7 +1979,7 @@ def build_planning_analytics(
     ]
 
     m3_by_destination_sku = {
-        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row["M3_POR_UNIDAD"]
+        (row["WAREHOUSE_DESTINATION"], row["RETAIL_ID"]): row.get("M3_POR_UNIDAD", 0.0)
         for row in base_rows
     }
     base_by_destination_sku = {
@@ -2042,7 +2030,7 @@ def build_planning_analytics(
         if source not in source_order:
             source_order.append(source)
         data = source_accumulators[source]
-        quantity = int(row["QUANTITY"])
+        quantity = int(row.get("QUANTITY", 0))
         destination = row["WAREHOUSE_DESTINATION"]
         sku = row["RETAIL_ID"]
         base_row = base_by_destination_sku.get((destination, sku), {})
@@ -2182,23 +2170,23 @@ def build_planning_analytics(
             }
         )
 
-    target_units = sum(int(row["CANTIDAD_OBJETIVO"]) for row in eligible_rows)
-    assigned_units = sum(int(row["CANTIDAD_ASIGNADA"]) for row in eligible_rows)
+    target_units = sum(int(row.get("CANTIDAD_OBJETIVO", 0)) for row in eligible_rows)
+    assigned_units = sum(int(row.get("CANTIDAD_ASIGNADA", 0)) for row in eligible_rows)
     original_roq_total = sum(original_roq_units(row) for row in eligible_rows)
     original_roq_fulfilled = sum(
-        min(int(row["CANTIDAD_ASIGNADA"]), original_roq_units(row))
+        min(int(row.get("CANTIDAD_ASIGNADA", 0)), original_roq_units(row))
         for row in eligible_rows
     )
     hardcode_target_units = sum(
-        max(int(row["CANTIDAD_OBJETIVO"]) - original_roq_units(row), 0)
+        max(int(row.get("CANTIDAD_OBJETIVO", 0)) - original_roq_units(row), 0)
         for row in eligible_rows
     )
     hardcode_assigned_units = sum(
-        max(int(row["CANTIDAD_ASIGNADA"]) - original_roq_units(row), 0)
+        max(int(row.get("CANTIDAD_ASIGNADA", 0)) - original_roq_units(row), 0)
         for row in eligible_rows
     )
     hardcode_cases = sum(
-        int(row["CANTIDAD_OBJETIVO"]) > original_roq_units(row)
+        int(row.get("CANTIDAD_OBJETIVO", 0)) > original_roq_units(row)
         for row in eligible_rows
     )
     return {
@@ -2229,7 +2217,7 @@ def build_planning_analytics(
             "hardcode_target_units": hardcode_target_units,
             "hardcode_assigned_units": hardcode_assigned_units,
             "m3_assigned": round(
-                sum(float(row["M3_ASIGNADO"]) for row in assigned_rows), 3
+                sum(float(row.get("M3_ASIGNADO", 0) or 0) for row in assigned_rows), 3
             ),
             "cities_served": len(city_rows),
             "stores_served": len(store_rows),
@@ -2249,30 +2237,29 @@ def build_planning_analytics(
             "forecast_zero_forced_cases": len(forecast_zero_forced),
             "forecast_zero_served_cases": len(forecast_zero_served),
             "forecast_zero_target_units": sum(
-                int(row["CANTIDAD_OBJETIVO"]) for row in forecast_zero_forced
+                int(row.get("CANTIDAD_OBJETIVO", 0)) for row in forecast_zero_forced
             ),
             "forecast_zero_assigned_units": sum(
-                int(row["CANTIDAD_ASIGNADA"]) for row in forecast_zero_forced
+                int(row.get("CANTIDAD_ASIGNADA", 0)) for row in forecast_zero_forced
             ),
             "deficit_forced_cases": len(deficit_forced),
             "deficit_forced_served_cases": sum(
-                row["CANTIDAD_ASIGNADA"] > 0 for row in deficit_forced
+                row.get("CANTIDAD_ASIGNADA", 0) > 0 for row in deficit_forced
             ),
             "net_transfer_forced_cases": len(net_transfer_forced),
             "net_transfer_forced_served_cases": sum(
-                row["CANTIDAD_ASIGNADA"] > 0 for row in net_transfer_forced
+                row.get("CANTIDAD_ASIGNADA", 0) > 0 for row in net_transfer_forced
             ),
             "minimum_three_cases": len(minimum_three_applied),
             "golden_cases": len(golden_rows),
             "golden_served_cases": sum(
-                row["CANTIDAD_ASIGNADA"] > 0 for row in golden_rows
+                row.get("CANTIDAD_ASIGNADA", 0) > 0 for row in golden_rows
             ),
         },
     }
 
 
 def apply_reporting_labels(result) -> None:
-    """Cambia únicamente etiquetas de salida; las reglas internas no se alteran."""
     for row in result.base_rows:
         cut_type = str(row.get("TIPO_DE_CORTE", ""))
         assigned = int(row.get("CANTIDAD_ASIGNADA", 0) or 0)
@@ -2353,7 +2340,6 @@ def apply_reporting_labels(result) -> None:
 
 
 def build_golden_analytics(result) -> dict[str, Any]:
-    """Construye el reporte específico de Golden Infaltables."""
     golden_rows = [
         row
         for row in result.base_rows
@@ -2572,7 +2558,6 @@ def split_plan_rows_by_blocked_city(
     blocked_cities: tuple[str, ...],
     config: engine.Config,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
-    """Bloquea solo necesidades positivas; los ceros conservan SIN RECOMENDACIÓN."""
     blocked_city_set = set(blocked_cities)
     active_rows: list[dict[str, Any]] = []
     blocked_rows: list[dict[str, Any]] = []
@@ -2672,8 +2657,9 @@ def apply_avl_fill(
     *,
     candidate_mode: str = "stockout",
     excluded_keys: set[tuple[int, int]] | None = None,
+    global_min_operative: int = 3,
+    preventive_threshold_doh: float = 1.0,
 ) -> dict[str, Any]:
-    """Usa tareas remanentes para stockouts o inventario preventivo del catálogo."""
     if candidate_mode not in {"stockout", "preventive"}:
         raise ValueError(f"Modo de cobertura de catálogo inválido: {candidate_mode}")
     summary = empty_avl_summary(True, doh)
@@ -2748,17 +2734,17 @@ def apply_avl_fill(
             if destination_stock > 0:
                 summary["skipped_not_stockout"] += 1
                 continue
-            target = max(int(math.ceil(adu * doh)), 3)
+            target = max(int(math.ceil(adu * doh)), global_min_operative)
             summary["stockout_candidates"] += 1
         else:
             if destination_stock <= 0 or not (
-                destination_stock < 3 or current_doh < 1
+                destination_stock < global_min_operative or current_doh < preventive_threshold_doh
             ):
                 summary["skipped_not_stockout"] += 1
                 continue
             target = max(
                 int(math.ceil(max((adu * doh) - destination_stock, 0.0))),
-                3,
+                global_min_operative,
             )
             summary["preventive_candidates"] += 1
         if key in assigned_keys or key in excluded_key_set:
@@ -3072,7 +3058,6 @@ def write_executive_pdf(
     fruver_811: dict[str, Any],
     input_consolidation: dict[str, Any],
 ) -> None:
-    """Genera un reporte PDF ejecutivo, legible y listo para compartir."""
     path.parent.mkdir(parents=True, exist_ok=True)
     page_width, page_height = landscape(A4)
     black = pdf_colors.HexColor("#111111")
@@ -3617,7 +3602,13 @@ def execute_planning(
     avl_doh: float = 3.0,
     block_fruver_811: bool = False,
     include_preventive_fill: bool = False,
+    global_min_operative: int = 3,
+    excluded_skus: set[int] = None,
+    preventive_threshold_doh: float = 1.0,
 ) -> dict[str, Any]:
+    if excluded_skus is None:
+        excluded_skus = set()
+        
     clear_previous_workspace()
     workspace = Path(tempfile.mkdtemp(prefix="transfer_planner_"))
     st.session_state["last_workspace"] = str(workspace)
@@ -3651,7 +3642,7 @@ def execute_planning(
         run_date_override=run_date.strftime("%d-%m-%Y"),
         default_store_capacity_m3=engine.CONFIG.default_store_capacity_m3,
         default_m3_per_unit=engine.CONFIG.default_m3_per_unit,
-        minimum_positive_quantity=engine.CONFIG.minimum_positive_quantity,
+        minimum_positive_quantity=global_min_operative,
         local_work_dir=str(workspace / "engine"),
         replace_same_day_outputs=True,
         generate_empty_source_files=False,
@@ -3686,6 +3677,7 @@ def execute_planning(
                 catalogs,
                 config,
                 canonical_plan_path,
+                global_min_operative,
             )
         )
         plan_read = engine.read_plan_csv(plan_path, config)
@@ -3694,9 +3686,19 @@ def execute_planning(
             consolidated_input,
             consolidation_summary,
         )
+        
+        initial_input_count = len(plan_read.rows)
+        rows_after_exclusion = [r for r in plan_read.rows if int(r.get("RETAIL_ID", 0)) not in excluded_skus]
+        excluded_count = initial_input_count - len(rows_after_exclusion)
+        if excluded_count > 0:
+            catalogs.warnings.append(
+                f"Exclusión manual: Se descartaron automáticamente {excluded_count} "
+                "requerimientos por coincidir con los SKUs bloqueados manualmente."
+            )
+
         rows_after_closed_stores, closed_plan_rows = (
             split_plan_rows_by_closed_store(
-                plan_read.rows,
+                rows_after_exclusion,
                 closed_store_ids,
             )
         )
@@ -3755,6 +3757,7 @@ def execute_planning(
         catalog_fill_rows: list[dict[str, Any]] = []
         if include_avl_fill or include_preventive_fill:
             avl_catalog_rows, avl_warnings = load_avl_catalog_rows(data_path)
+            avl_catalog_rows = [r for r in avl_catalog_rows if int(r.get("RETAIL_ID", 0)) not in excluded_skus]
             result.warnings.extend(avl_warnings)
             catalog_fill_rows = avl_catalog_rows
 
@@ -3768,6 +3771,7 @@ def execute_planning(
                 closed_store_ids,
                 blocked_cities,
                 avl_doh,
+                global_min_operative=global_min_operative,
             )
             result.warnings.append(
                 f"Cobertura AVL ({avl_doh:g} DOH): se agregaron "
@@ -3793,6 +3797,8 @@ def execute_planning(
                 avl_doh,
                 candidate_mode="preventive",
                 excluded_keys=fountain_recommended_keys,
+                global_min_operative=global_min_operative,
+                preventive_threshold_doh=preventive_threshold_doh,
             )
             result.warnings.append(
                 f"Blindaje preventivo ({avl_doh:g} DOH): se agregaron "
@@ -3806,7 +3812,7 @@ def execute_planning(
         attach_consolidated_input_to_result(result, consolidated_input)
         omit_unexecuted_manual_task_rows(result)
         normalize_result_storage(result)
-        analytics = build_planning_analytics(result, origins)
+        analytics = build_planning_analytics(result, origins, global_min_operative)
         apply_reporting_labels(result)
         analytics["golden"] = build_golden_analytics(result)
         output_dir = (
@@ -4594,22 +4600,21 @@ def render_planning_analytics(analytics: dict[str, Any]) -> None:
             },
             {
                 "category": "CASOS · NET TRANSFER",
-                "label": "RIESGO BAJO · FORZADO A 3",
+                "label": "RIESGO BAJO · FORZADO AL MÍNIMO",
                 "value": f"{summary.get('net_transfer_forced_cases', 0):,}",
                 "description": (
-                    "Casos sin ROQ positivo, con Net Inter-Store Transfers menor o "
-                    "igual a 3 e inventario final en tienda menor a 3 unidades cuyo "
-                    "objetivo fue forzado a tres."
+                    "Casos sin ROQ positivo, con Net Inter-Store Transfers bajo e "
+                    "inventario final en tienda bajo, cuyo objetivo fue forzado al mínimo global."
                 ),
                 "tone": "coral",
             },
             {
                 "category": "CASOS · ROQ POSITIVO",
-                "label": "MÍNIMO DE 3 APLICADO",
+                "label": "MÍNIMO GLOBAL APLICADO",
                 "value": f"{summary['minimum_three_cases']:,}",
                 "description": (
-                    "Casos cuyo ROQ original era positivo pero menor a tres y se "
-                    "elevó al mínimo operativo de tres unidades."
+                    "Casos cuyo ROQ original era positivo pero menor al mínimo y se "
+                    "elevó al mínimo operativo global."
                 ),
             },
         ],
@@ -5159,8 +5164,9 @@ def main() -> None:
     ] or [444, 831]
 
     with st.form("planning_config"):
-        left, right = st.columns([2, 1])
-        with left:
+        
+        with st.container(border=True):
+            st.markdown("**📍 ORÍGENES Y RESTRICCIONES GEOGRÁFICAS**")
             selected_origins = st.multiselect(
                 "Warehouses origen — selecciona en orden de prioridad",
                 options=list(ORIGIN_WAREHOUSES),
@@ -5171,55 +5177,73 @@ def main() -> None:
                     "la prioridad, elimina las opciones y vuelve a elegirlas."
                 ),
             )
-        with right:
-            max_tasks = st.number_input(
-                "Máximo de tareas",
-                min_value=0,
-                max_value=1_000_000,
-                value=int(engine.CONFIG.max_tasks),
-                step=500,
+            
+            selected_blocked_cities = st.multiselect(
+                "Bloquear ciudades completas — opcional",
+                options=list(city_labels),
+                default=[],
+                format_func=lambda city: city_labels.get(city, city),
+                help=(
+                    "No se generarán envíos hacia las ciudades seleccionadas. Sus "
+                    "requerimientos se eliminan antes de asignar, por lo que ese stock "
+                    "queda disponible para otras tiendas."
+                ),
+            )
+            if selected_blocked_cities:
+                selected_names = ", ".join(
+                    city_labels.get(city, city) for city in selected_blocked_cities
+                )
+                st.warning(f"Se bloqueará completamente: {selected_names}")
+
+        with st.container(border=True):
+            st.markdown("**⚙️ PARÁMETROS OPERATIVOS**")
+            col_op1, col_op2, col_op3 = st.columns(3)
+            with col_op1:
+                max_tasks = st.number_input(
+                    "Máximo de tareas",
+                    min_value=0,
+                    max_value=1_000_000,
+                    value=int(engine.CONFIG.max_tasks),
+                    step=500,
+                )
+            with col_op2:
+                global_min_operative = st.number_input(
+                    "Mínimo operativo global",
+                    min_value=1,
+                    value=3,
+                    step=1,
+                    help="Piso absoluto de unidades para enviar stock normal y reglas por debajo del inventario deseado."
+                )
+            with col_op3:
+                excluded_skus_str = st.text_input(
+                    "Exclusión manual de SKUs", 
+                    placeholder="Ej: 85097, 86195",
+                    help="Bloquea estos SKUs instantáneamente separándolos por coma, espacio o salto de línea."
+                )
+
+        with st.container(border=True):
+            st.markdown("**🛡️ REGLAS ADICIONALES Y COBERTURAS**")
+            include_insumos = st.toggle(
+                "Agregar insumos al BulkCD_444",
+                value=True,
+                help=(
+                    "Cuando está activo, anexa los insumos de Aleph únicamente a las "
+                    "tiendas que ya reciben producto normal desde el warehouse 444. "
+                    "No consumen tareas ni capacidad; el envío se limita por el stock "
+                    "ajustado del 444 y se recorta en múltiplos de MOQ."
+                ),
             )
 
-        selected_blocked_cities = st.multiselect(
-            "Bloquear ciudades completas — opcional",
-            options=list(city_labels),
-            default=[],
-            format_func=lambda city: city_labels.get(city, city),
-            help=(
-                "No se generarán envíos hacia las ciudades seleccionadas. Sus "
-                "requerimientos se eliminan antes de asignar, por lo que ese stock "
-                "queda disponible para otras tiendas."
-            ),
-        )
-        if selected_blocked_cities:
-            selected_names = ", ".join(
-                city_labels.get(city, city) for city in selected_blocked_cities
+            block_fruver_811 = st.toggle(
+                "Bloquear envíos FRUVER desde el warehouse 811",
+                value=False,
+                help=(
+                    "Cuando está activo y el 811 es un origen seleccionado, su stock "
+                    "de productos clasificados como FRUVER queda fuera de la asignación. "
+                    "El motor puede cubrirlos desde los demás orígenes disponibles."
+                ),
             )
-            st.warning(f"Se bloqueará completamente: {selected_names}")
 
-        include_insumos = st.toggle(
-            "Agregar insumos al BulkCD_444",
-            value=True,
-            help=(
-                "Cuando está activo, anexa los insumos de Aleph únicamente a las "
-                "tiendas que ya reciben producto normal desde el warehouse 444. "
-                "No consumen tareas ni capacidad; el envío se limita por el stock "
-                "ajustado del 444 y se recorta en múltiplos de MOQ."
-            ),
-        )
-
-        block_fruver_811 = st.toggle(
-            "Bloquear envíos FRUVER desde el warehouse 811",
-            value=False,
-            help=(
-                "Cuando está activo y el 811 es un origen seleccionado, su stock "
-                "de productos clasificados como FRUVER queda fuera de la asignación. "
-                "El motor puede cubrirlos desde los demás orígenes disponibles."
-            ),
-        )
-
-        avl_left, preventive_right = st.columns(2)
-        with avl_left:
             include_avl_fill = st.toggle(
                 "Cubrir stockouts del catálogo (AVL)",
                 value=False,
@@ -5230,33 +5254,42 @@ def main() -> None:
                     "rackeados y prioridad de orígenes."
                 ),
             )
-        with preventive_right:
+            
             include_preventive_fill = st.toggle(
                 "Blindar posibles quiebres del catálogo",
                 value=False,
                 help=(
                     "En una última pasada busca productos del catálogo con inventario "
-                    "positivo, pero menor a 1 DOH o menor a 3 unidades. Solo aplica "
-                    "cuando Fountain9 no generó una recomendación positiva para ese "
-                    "caso y utiliza exclusivamente tareas sobrantes."
+                    "positivo, pero en riesgo. Utiliza exclusivamente las tareas remanentes."
                 ),
             )
 
-        _, doh_column, _ = st.columns([1, 2, 1])
-        with doh_column:
-            avl_doh = st.number_input(
-                "DOH objetivo para coberturas de catálogo",
-                min_value=0.5,
-                max_value=30.0,
-                value=3.0,
-                step=0.5,
-                disabled=not (include_avl_fill or include_preventive_fill),
-                help=(
-                    "Para stockout, objetivo = ADU × DOH. Para el blindaje, objetivo "
-                    "adicional = ADU × DOH menos el inventario actual. En ambos se "
-                    "envían al menos 3 unidades, salvo que el stock permitido no alcance."
-                ),
-            )
+            doh_col, risk_col, _ = st.columns([1.5, 1.5, 2])
+            with doh_col:
+                avl_doh = st.number_input(
+                    "DOH objetivo (Catálogos)",
+                    min_value=0.5,
+                    max_value=30.0,
+                    value=3.0,
+                    step=0.5,
+                    help=(
+                        "Para stockout, objetivo = ADU × DOH. Para el blindaje, objetivo "
+                        "adicional = ADU × DOH menos el inventario actual. En ambos se "
+                        "envía al menos el mínimo operativo global."
+                    ),
+                )
+            with risk_col:
+                preventive_risk_doh = st.number_input(
+                    "Umbral riesgo preventivo (DOH)",
+                    min_value=0.5,
+                    max_value=30.0,
+                    value=1.0,
+                    step=0.5,
+                    help=(
+                        "Si el inventario de un catálogo está por debajo de este DOH (o del mínimo operativo) "
+                        "el blindaje preventivo intentará rellenarlo para evitar el quiebre."
+                    )
+                )
 
         submitted = st.form_submit_button(
             "EJECUTAR PLANEACIÓN →", use_container_width=True
@@ -5269,6 +5302,13 @@ def main() -> None:
         if not selected_origins:
             st.error("Selecciona al menos un warehouse origen.")
             st.stop()
+            
+        excluded_skus = set()
+        for part in re.split(r"[,\s]+", str(excluded_skus_str)):
+            part = part.strip()
+            if part.isdigit():
+                excluded_skus.add(int(part))
+                
         try:
             origins = tuple(selected_origins)
             with st.status("Ejecutando motor de planeación…", expanded=True) as status:
@@ -5285,6 +5325,9 @@ def main() -> None:
                         "La base de datos tiene una o más fuentes con error. "
                         "Abre el panel de estado y corrige las hojas indicadas."
                     )
+                    
+                if excluded_skus:
+                    st.write(f"Excluyendo manualmente {len(excluded_skus)} SKUs ingresados...")
                 if selected_blocked_cities:
                     blocked_names = ", ".join(
                         city_labels.get(city, city)
@@ -5318,8 +5361,8 @@ def main() -> None:
                     )
                 if include_preventive_fill:
                     st.write(
-                        "Reservando la última pasada para inventarios positivos con "
-                        "menos de 1 DOH o menos de 3 unidades, sin recomendación "
+                        f"Reservando la última pasada para inventarios con riesgo menor a "
+                        f"{preventive_risk_doh:g} DOH o {global_min_operative} unidades, sin recomendación "
                         "positiva de Fountain9…"
                     )
                 run = execute_planning(
@@ -5334,6 +5377,9 @@ def main() -> None:
                     avl_doh=float(avl_doh),
                     block_fruver_811=block_fruver_811,
                     include_preventive_fill=include_preventive_fill,
+                    global_min_operative=int(global_min_operative),
+                    excluded_skus=excluded_skus,
+                    preventive_threshold_doh=float(preventive_risk_doh),
                 )
                 status.update(label="Planeación finalizada", state="complete", expanded=False)
             st.session_state["last_run"] = run
