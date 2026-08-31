@@ -5074,9 +5074,9 @@ def main() -> None:
     st.markdown(
         """
         <section class="hero">
-            <span class="hero-kicker">ABASTO / MX / WEB</span>
+            <span class="hero-kicker">Turbo MX</span>
             <h1>TRANSFER<br>PLANNER.</h1>
-            <p>Sube el requerimiento diario, define los orígenes y ejecuta el mismo motor sin editar código. La base se consulta y valida automáticamente.</p>
+            <p>Sube el requerimiento de Fountain9 y define los orígenes con base en los niveles de inventario sin editar la necesidad base. La base se consulta y valida automáticamente.</p>
         </section>
         """,
         unsafe_allow_html=True,
@@ -5107,7 +5107,7 @@ def main() -> None:
         fetch_public_database.clear()
         st.rerun()
 
-    st.markdown('<span class="section-label">02 — ARCHIVO DE PLANEACIÓN</span>', unsafe_allow_html=True)
+    st.markdown('<span class="section-label">02 — UPLOAD FILES</span>', unsafe_allow_html=True)
     uploaded_plans = st.file_uploader(
         "Archivos de planeación (.csv)",
         type=["csv"],
@@ -5156,7 +5156,7 @@ def main() -> None:
         origin
         for origin in engine.CONFIG.origin_warehouses
         if origin in ORIGIN_WAREHOUSES
-    ] or [811, 834]
+    ] or [444, 831]
 
     with st.form("planning_config"):
         left, right = st.columns([2, 1])
