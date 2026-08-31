@@ -5166,7 +5166,7 @@ def main() -> None:
     with st.form("planning_config"):
         
         with st.container(border=True):
-            st.markdown("**📍 ORÍGENES Y RESTRICCIONES GEOGRÁFICAS**")
+            st.markdown("**ORÍGENES Y RESTRICCIONES GEOGRÁFICAS**")
             selected_origins = st.multiselect(
                 "Warehouses origen — selecciona en orden de prioridad",
                 options=list(ORIGIN_WAREHOUSES),
@@ -5196,7 +5196,7 @@ def main() -> None:
                 st.warning(f"Se bloqueará completamente: {selected_names}")
 
         with st.container(border=True):
-            st.markdown("**⚙️ PARÁMETROS OPERATIVOS**")
+            st.markdown("**PARÁMETROS OPERATIVOS**")
             col_op1, col_op2, col_op3 = st.columns(3)
             with col_op1:
                 max_tasks = st.number_input(
@@ -5222,7 +5222,7 @@ def main() -> None:
                 )
 
         with st.container(border=True):
-            st.markdown("**🛡️ REGLAS ADICIONALES Y COBERTURAS**")
+            st.markdown("**REGLAS ADICIONALES Y COBERTURAS**")
             include_insumos = st.toggle(
                 "Agregar insumos al BulkCD_444",
                 value=True,
